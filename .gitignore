@@ -1,0 +1,11 @@
+experiments*/
+preprocessed*/
+cipic*/
+chedar/
+ari/
+hutubs/
+scut/
+cache/
+checkpoints/
+torchmeta/
+__pycache__/

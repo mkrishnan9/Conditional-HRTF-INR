@@ -10,7 +10,7 @@ import librosa
 from matplotlib import pyplot as plt
 
 
-DATASET_PATH = "/data2/neil/HRTF/datasets/"
+DATASET_PATH = "/export/mkrishn9/hrtf_field/hutubs/"
 
 
 def transR2L(positions):
@@ -65,7 +65,7 @@ class SOFADataset(Dataset):
     def __init__(self):
         super(SOFADataset, self).__init__()
         self.name = None
-        self.sofa_dir = None  # a directory that include all the sofa files
+        self.sofa_dir = "/export/mkrishn9/hrtf_field/hutubs/" # a directory that include all the sofa files
         # self._expand_basic_info()
 
     def _expand_basic_info(self):
@@ -157,7 +157,7 @@ class SOFADataset(Dataset):
         if orig_sr == 44100:
             return orig_ir
         else:   # resample 44100
-            return librosa.resample(orig_ir, int(orig_sr), 44100)
+            return librosa.resample(orig_ir, orig_sr= int(orig_sr), target_sr=44100)
 
     def _sanity_check(self):
         for key in list(self.__dir__()):
@@ -259,7 +259,7 @@ class SOFADataset(Dataset):
             if orig_sr == 44100:
                 irs.append(np.array(orig_ir))
             else:  # resample 44100
-                irs.append(librosa.resample(orig_ir, int(orig_sr), 44100))
+                irs.append(librosa.resample(orig_ir, orig_sr=int(orig_sr), target_sr=44100))
         return locations, np.array(irs)
 
 
@@ -267,7 +267,7 @@ class ARI(SOFADataset):
     def __init__(self):
         super(ARI, self).__init__()
         self.name = "ari"
-        self.sofa_dir = os.path.join(DATASET_PATH, "ari")
+        self.sofa_dir = "/export/mkrishn9/hrtf_field/ari/"
         self._expand_basic_info()
 
     def _get_all_sofa_files_from_dir(self):
@@ -284,7 +284,9 @@ class HUTUBS(SOFADataset):
     def __init__(self):
         super(HUTUBS, self).__init__()
         self.name = "hutubs"
-        self.sofa_dir = os.path.join(DATASET_PATH, "HUTUBS/HRIRs")
+        DATASET_PATH = "/export/mkrishn9/hrtf_field/hutubs/"
+        # self.sofa_dir = os.path.join(DATASET_PATH, "HUTUBS/HRIRs")
+        self.sofa_dir = DATASET_PATH
         self._expand_basic_info()
 
     def _get_all_sofa_files_from_dir(self):
@@ -318,7 +320,7 @@ class CIPIC(SOFADataset):
     def __init__(self):
         super(CIPIC, self).__init__()
         self.name = "cipic"
-        self.sofa_dir = os.path.join(DATASET_PATH, "CIPIC/sofa")
+        self.sofa_dir = "/export/mkrishn9/hrtf_field/cipic" # os.path.join(DATASET_PATH, "CIPIC/sofa")
         self._expand_basic_info()
 
     def _get_all_sofa_files_from_dir(self):
@@ -329,6 +331,44 @@ class CIPIC(SOFADataset):
 
     def _get_sofa_path_from_ID(self, subject_ID):
         return os.path.join(self.sofa_dir, "subject_%03d.sofa" % int(subject_ID))
+
+class SCUT(SOFADataset):
+    def __init__(self):
+        super(SCUT, self).__init__()
+        self.name = "scut"
+        self.sofa_dir = "/export/mkrishn9/hrtf_field/scut/"
+        self._expand_basic_info()
+
+    def _get_all_sofa_files_from_dir(self):
+        return glob.glob(os.path.join(self.sofa_dir, "SCUT_NF*.sofa"))
+
+    def _get_ID_from_sofa_path(self, path):
+        basename = os.path.basename(path)
+        subject_part = basename.split('_')[2]
+        return subject_part.replace('subject', '')
+
+    def _get_sofa_path_from_ID(self, subject_ID):
+        filename = f"SCUT_NF_subject{int(subject_ID):04d}_measured.sofa"
+        return os.path.join(self.sofa_dir, filename)
+
+class CHEDAR(SOFADataset):
+    def __init__(self):
+        super(CHEDAR, self).__init__()
+        self.name = "chedar"
+        self.sofa_dir = "/export/mkrishn9/hrtf_field/chedar/"
+        self._expand_basic_info()
+
+    def _get_all_sofa_files_from_dir(self):
+        return glob.glob(os.path.join(self.sofa_dir, "chedar_*_UV1m.sofa"))
+
+    def _get_ID_from_sofa_path(self, path):
+        basename = os.path.basename(path)
+        subject_part = basename.split('_')[1]
+        return subject_part
+
+    def _get_sofa_path_from_ID(self, subject_ID):
+        filename = f"chedar_{int(subject_ID):04d}_UV1m.sofa"
+        return os.path.join(self.sofa_dir, filename)
 
 
 class SADIE(SOFADataset):

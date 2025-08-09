@@ -11,7 +11,7 @@ import random
 import re
 import os
 import collections
-from HRTFdatasets import HRTFDataset, MergedHRTFDataset
+from HRTFdatasets import MergedHRTFDataset
 from model import (
         HRTFNetwork,
         AnthropometryEncoder,
@@ -22,6 +22,11 @@ from model import (
         Sine,
         MetaSequential,
     )
+
+import logging
+
+import argparse
+
 
 
 
@@ -237,38 +242,40 @@ def custom_collate_fn_init(batch):
 
 # --- Main Training Function ---
 
-def train():
+def train(args):
     # --- Configuration ---
-    DEVICE = torch.device("cuda:7" if torch.cuda.is_available() else "cpu")
+    DEVICE = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
+
+
+    # Create a unique save directory for this specific run
+    run_name = f"lr{args.lr}_bs{args.batch_size}_ld{args.latent_dim}_hd{args.hidden_dim}_nl{args.n_layers}"
+    SAVE_DIR = os.path.join(args.save_dir, run_name)
+    os.makedirs(SAVE_DIR, exist_ok=True)
+
+
+
+    # Setup logging to save to a file in the run's main directory
+
     print(f"Using device: {DEVICE}")
+    print(f"Checkpoints and logs will be saved to: {SAVE_DIR}")
 
-    # ** USER CONFIGURATION REQUIRED **
-    DATASET_NAME = "hutubs"       # HRTF dataset name (e.g., "cipic", "ari")
 
-    DATA_PATH = "/export/mkrishn9/hrtf_field/preprocessed_hrirs_common"
+
+
+    DATA_PATH = args.data_path
     # <<< UPDATE dimension of your anthropometry data >>>
-    ANTHROPOMETRY_DIM = 23
-    SAVE_DIR = "./checkpoints"      # Directory to save model checkpoints
+    ANTHROPOMETRY_DIM = 19 # 23 ### HARDCODED
+
     # *******************************
 
     # Model & Training Parameters
     NUM_FREQ_BINS = 92             # Number of frequency bins (1 to 92 inclusive)
     TARGET_FREQ_DIM = NUM_FREQ_BINS # Model output dimension
-    LATENT_DIM = 128
-    DECODER_HIDDEN_DIM = 128
-    DECODER_LAYERS = 5
     DECODER_INIT = 'siren'         # Initialization type for decoder (ensure model.py handles this)
     DECODER_NONLINEARITY = 'sine'  # Activation function for decoder
 
-    LEARNING_RATE = 1e-4
-    BATCH_SIZE = 1               # Number of subjects per batch
-    NUM_EPOCHS = 1000                # Number of training epochs
-    VALIDATION_SPLIT = 0.15         # Fraction for validation set
+
     SEED = 42
-    NORM_WAY = 0                    # HRTF magnitude normalization method (0-3) - from dataset
-    SCALE = 'log'                # HRTF magnitude scale ('linear' or 'log') - from dataset
-    NUM_WORKERS = 4                 # DataLoader workers (set to 0 if debugging issues)
-    ETA_MIN = 1e-7
 
 
     os.makedirs(SAVE_DIR, exist_ok=True)
@@ -276,114 +283,45 @@ def train():
 
     torch.manual_seed(SEED)
     np.random.seed(SEED)
-    if DEVICE == torch.device("cuda:1"):
-        torch.cuda.manual_seed_all(SEED)
+
+    torch.cuda.manual_seed_all(SEED)
 
     # --- Dataset and Loaders ---
     print("Loading dataset...")
-    # try:
-    #     # Instantiate dataset - assuming it's imported correctly now
-    #     full_dataset = HRTFDataset(dataset=DATASET_NAME, scale=SCALE, norm_way=NORM_WAY)
-    #     # Perform a quick check on the first item
-    #     if len(full_dataset) > 0:
-    #          print("Checking first dataset item...")
-    #          loc_check, hrtf_check, anthro_check = full_dataset[0]
-    #          print(f"  Location shape: {loc_check.shape}")
-    #          print(f"  HRTF shape: {hrtf_check.shape}")
-    #          print(f"  Anthro shape: {anthro_check.shape}")
-    #          # Verify dimensions match expectations
-    #          assert loc_check.ndim == 2 and loc_check.shape[1] == 2, f"Unexpected location shape: {loc_check.shape}"
-    #          assert hrtf_check.ndim == 2 and hrtf_check.shape[1] == NUM_FREQ_BINS, f"Unexpected HRTF shape: {hrtf_check.shape}, expected {NUM_FREQ_BINS} freq bins"
-    #          assert anthro_check.ndim == 1 and anthro_check.shape[0] == ANTHROPOMETRY_DIM, f"Unexpected Anthro shape: {anthro_check.shape}, expected dim {ANTHROPOMETRY_DIM}"
-    #          print("First item check passed.")
-    #     else:
-    #          print("Warning: Dataset loaded but is empty.")
-    # except FileNotFoundError as e:
-    #     print(f"Error: {e}")
-    #     print("Please update the DATA_PATH variable in the script.")
-    #     return
 
 
-    # # Split dataset
-    # dataset_size = len(full_dataset)
-    # if dataset_size == 0:
-    #     print("Error: Dataset is empty. Check data path and dataset name.")
-    #     return
-    # val_size = int(np.floor(VALIDATION_SPLIT * dataset_size))
-    # train_size = dataset_size - val_size
-    # print(f"Dataset size: {dataset_size}, Train size: {train_size}, Validation size: {val_size}")
-
-    # try:
-    #     num_subjects = full_dataset.dataset_obj.num_of_subjects
-    # except AttributeError:
-    #     num_subjects = len(full_dataset.valid_indices) // 2
-
-    # subject_indices = list(range(num_subjects))
-    # np.random.seed(SEED)
-    # np.random.shuffle(subject_indices)
-
-    # # 3. Split the list of SUBJECTS
-    # val_num_subjects = int(np.floor(VALIDATION_SPLIT * num_subjects))
-    # train_subject_ids = subject_indices[val_num_subjects:]
-    # val_subject_ids = subject_indices[:val_num_subjects]
-    # train_indices = []
-    # for sub_idx in train_subject_ids:
-    #     train_indices.extend([sub_idx * 2, sub_idx * 2 + 1])
-
-    # val_indices = []
-    # for sub_idx in val_subject_ids:
-    #     val_indices.extend([sub_idx * 2, sub_idx * 2 + 1])
-
-    # # Ensure the indices exist in the dataset (handles missing files)
-    # train_indices = [i for i in train_indices if i in full_dataset.valid_indices]
-    # print(train_indices)
-    # val_indices = [i for i in val_indices if i in full_dataset.valid_indices]
-    # print(val_indices)
-
-
-
-    # print(f"Total ears: {len(full_dataset)}, Train ears: {len(train_indices)}, Val ears: {len(val_indices)}")
-
-
-    # train_dataset_obj = HRTFDataset(dataset=DATASET_NAME, scale=SCALE, norm_way=NORM_WAY, augment=True) # (add other params)
-    # val_dataset_obj = HRTFDataset(dataset=DATASET_NAME, scale=SCALE, norm_way=NORM_WAY, augment=False) # (add other params)
-
-    # train_dataset = Subset(train_dataset_obj, train_indices)
-    # val_dataset = Subset(val_dataset_obj, val_indices)
-
-
-
-
-
-    # # train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size],
-    # #                                          generator=torch.Generator().manual_seed(SEED))
-
-    # # val_dataset.dataset.set_augment(False)
-    # # train_dataset.dataset.set_augment(True)
-
-    # train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,collate_fn=custom_collate_fn, num_workers=NUM_WORKERS,pin_memory=True, drop_last=True, persistent_workers=(NUM_WORKERS > 0)) # Added persistent_workers
-    # val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=custom_collate_fn, num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=(NUM_WORKERS > 0))
-
-    # try:
-    #     anthro_mean, anthro_std = calculate_anthro_stats(train_dataset)
-    #     anthro_mean = anthro_mean.to(DEVICE)
-    #     anthro_std = anthro_std.to(DEVICE)
-    #     print(f"Anthro Mean (sample): {anthro_mean[:5].cpu().numpy()}")
-    #     print(f"Anthro Std (sample): {anthro_std[:5].cpu().numpy()}")
-    # except (ValueError, TypeError, RuntimeError) as e:
-    #     print(f"Error calculating stats: {e}")
-    #     return
-
-
-    all_datasets_to_load = ["hutubs", "cipic", "ari"] # Add other dataset names here
+    all_datasets_to_load = ["hutubs", "cipic", "ari", "scut","chedar"] # Add other dataset names here
 
     merged_dataset = MergedHRTFDataset(
         dataset_names=all_datasets_to_load,
         preprocessed_dir=DATA_PATH,
-        augment=True,
+        augment=False,
         aug_prob=0.5,
         scale="log" # Example: use log scale for training
     )
+
+    # --- Subject-Aware Splitting Logic ---
+    # subjects = {}
+    # print("Mapping subjects to registry indices for splitting...")
+    # for i, file_path in enumerate(merged_dataset.file_registry):
+    #     base_name = os.path.basename(file_path)
+    #     match = re.match(r"([a-zA-Z0-9]+)_(\d+).pkl", base_name)
+    #     if not match: continue
+    #     dataset_name, file_num = match.group(1), int(match.group(2))
+    #     subject_id_in_dataset = file_num // 2
+    #     subject_key = (dataset_name, subject_id_in_dataset)
+    #     if subject_key not in subjects: subjects[subject_key] = []
+    #     subjects[subject_key].append(i)
+
+    # all_subjects = list(subjects.keys())
+    # random.shuffle(all_subjects)
+    # num_val_subjects = int(len(all_subjects) * args.val_split)
+    # val_subject_keys = all_subjects[:num_val_subjects]
+    # train_subject_keys = all_subjects[num_val_subjects:]
+    # train_indices = [idx for key in train_subject_keys for idx in subjects[key]]
+    # val_indices = [idx for key in val_subject_keys for idx in subjects[key]]
+    # print(f"Total unique subjects: {len(all_subjects)}, Train: {len(train_subject_keys)}, Val: {len(val_subject_keys)}")
+    # print(f"Total ears: {len(merged_dataset)}, Train: {len(train_indices)}, Val: {len(val_indices)}")
 
     # --- Subject-Aware Splitting Logic ---
     subjects = {}
@@ -398,19 +336,41 @@ def train():
         if subject_key not in subjects: subjects[subject_key] = []
         subjects[subject_key].append(i)
 
-    all_subjects = list(subjects.keys())
-    random.shuffle(all_subjects)
-    num_val_subjects = int(len(all_subjects) * VALIDATION_SPLIT)
-    val_subject_keys = all_subjects[:num_val_subjects]
-    train_subject_keys = all_subjects[num_val_subjects:]
+
+    chedar_subjects = []
+    other_subjects = []
+    for subject_key in subjects.keys():
+        if subject_key[0] == 'chedar':
+            chedar_subjects.append(subject_key)
+        else:
+            other_subjects.append(subject_key)
+
+    print(f"Found {len(chedar_subjects)} 'chedar' subjects and {len(other_subjects)} subjects from other datasets.")
+
+    # Perform the validation split ONLY on the non-chedar subjects
+    random.shuffle(other_subjects)
+    # Note: val_split is now applied to the count of 'other' subjects, not the total.
+    num_val_subjects = int(len(other_subjects) * args.val_split)
+    val_subject_keys = other_subjects[:num_val_subjects]
+
+    # The training set includes the remaining 'other' subjects AND all 'chedar' subjects
+    train_other_subject_keys = other_subjects[num_val_subjects:]
+    train_subject_keys = train_other_subject_keys + chedar_subjects
+
+
+    # The rest of the code remains the same
     train_indices = [idx for key in train_subject_keys for idx in subjects[key]]
     val_indices = [idx for key in val_subject_keys for idx in subjects[key]]
-    print(f"Total unique subjects: {len(all_subjects)}, Train: {len(train_subject_keys)}, Val: {len(val_subject_keys)}")
+
+    total_subjects = len(chedar_subjects) + len(other_subjects)
+    print(f"Total unique subjects: {total_subjects}, Train: {len(train_subject_keys)}, Val: {len(val_subject_keys)}")
     print(f"Total ears: {len(merged_dataset)}, Train: {len(train_indices)}, Val: {len(val_indices)}")
 
     # --- Create Subsets and DataLoaders ---
     train_subset = Subset(merged_dataset, train_indices)
     val_subset = Subset(merged_dataset, val_indices)
+
+
 
     try:
         anthro_mean, anthro_std = calculate_anthro_stats(train_subset)
@@ -422,12 +382,12 @@ def train():
         print(f"Error calculating stats: {e}")
         return
 
-    merged_dataset.set_augmentation(True)
-    train_loader = DataLoader(train_subset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=merged_collate_fn)
+    merged_dataset.set_augmentation(False)
+    train_loader = DataLoader(train_subset, batch_size=args.batch_size, shuffle=True, collate_fn=merged_collate_fn,num_workers=8, pin_memory=True)
 
     merged_dataset.set_augmentation(False)
-    val_loader = DataLoader(val_subset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=merged_collate_fn)
-
+    val_loader = DataLoader(val_subset, batch_size=args.batch_size, shuffle=False, collate_fn=merged_collate_fn,num_workers=8, pin_memory=True)
+    NUM_EPOCHS = args.epochs
 
 
 
@@ -436,24 +396,24 @@ def train():
     model = HRTFNetwork(
             anthropometry_dim=ANTHROPOMETRY_DIM,
             target_freq_dim=TARGET_FREQ_DIM,
-            latent_dim=LATENT_DIM,
-            decoder_hidden_dim=DECODER_HIDDEN_DIM,
-            decoder_n_hidden_layers=DECODER_LAYERS,
+            latent_dim=args.latent_dim,
+            decoder_hidden_dim=args.hidden_dim,
+            decoder_n_hidden_layers=args.n_layers,
             init_type=DECODER_INIT,
             nonlinearity=DECODER_NONLINEARITY
         ).to(DEVICE)
 
 
 
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
     #criterion = nn.MSELoss()
-    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=ETA_MIN)
+    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=args.eta_min)
     print(f"Model parameter count: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     print("Starting training...")
     best_val_loss = float('inf')
 
     # --- Training Loop ---
-    for epoch in range(NUM_EPOCHS):
+    for epoch in range(args.epochs):
         model.train()
         train_loss_accum = 0.0
         processed_batches = 0
@@ -468,6 +428,7 @@ def train():
 
             locations = locations.to(DEVICE, non_blocking=True)
             target_hrtfs = target_hrtfs.to(DEVICE, non_blocking=True)
+            breakpoint()
             masks = masks.to(DEVICE, non_blocking=True)
             anthropometry = anthropometry.to(DEVICE, non_blocking=True)
 
@@ -484,6 +445,7 @@ def train():
             anthro_expanded = anthropometry_norm.unsqueeze(1).expand(B, N_loc, anthro_dim)
             locations_flat = locations.reshape(-1, 2)
             anthro_flat = anthro_expanded.reshape(-1, anthro_dim)
+
 
             optimizer.zero_grad()
 
@@ -509,7 +471,7 @@ def train():
 
             # --- Calculate LSD metric using masks ---
             with torch.no_grad():
-                if SCALE == 'log': # LSD for log scale data
+                if args.scale == 'log': # LSD for log scale data
                     lsd_elements_sq = torch.square(predicted_hrtfs - target_hrtfs) # error_squared is already this
                 else: # LSD for linear scale data (original formula)
                     epsilon = 1e-9
@@ -560,6 +522,9 @@ def train():
                 masks = masks.to(DEVICE, non_blocking=True)
                 anthropometry = anthropometry.to(DEVICE, non_blocking=True)
 
+
+
+
                 try:
                     anthropometry_norm = normalize_anthro(anthropometry, anthro_mean.to(DEVICE), anthro_std.to(DEVICE))
 
@@ -586,7 +551,7 @@ def train():
                     if num_valid_points_batch > 0:
                          batch_loss_sum = torch.sum(masked_error_squared)
                          val_loss_accum += batch_loss_sum.item()
-                         if SCALE == 'log':
+                         if args.scale == 'log':
                             lsd_elements_sq = torch.square(predicted_hrtfs - target_hrtfs)
                          else:
                             epsilon = 1e-9
@@ -612,7 +577,7 @@ def train():
         scheduler.step()
 
 
-        print(f'Epoch [{epoch+1:03d}/{NUM_EPOCHS}], Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}, Train LSD: {avg_train_lsd:.4f}, Val LSD: {avg_val_lsd:.4f}')
+        print(f'Epoch [{epoch+1:03d}/{args.epochs}], Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}, Train LSD: {avg_train_lsd:.4f}, Val LSD: {avg_val_lsd:.4f}')
 
 
 
@@ -643,12 +608,38 @@ def train():
     print(f"Check '{SAVE_DIR}' for the best model checkpoint.")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="HRTF Anthropometry Model Training")
+
+    # Path Arguments
+    parser.add_argument('--data_path', type=str, default="/export/mkrishn9/hrtf_field/preprocessed_hrirs_common_ic", help='Path to preprocessed data')
+    parser.add_argument('--save_dir', type=str, default="/export/mkrishn9/hrtf_field/experiments", help='Directory to save experiment checkpoints')
+    parser.add_argument('--gpu', type=int, default=7, help='GPU device ID to use')
+
+    # Training Hyperparameters
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size per GPU')
+    parser.add_argument('--epochs', type=int, default=1000, help='Number of training epochs')
+
+    # Model Hyperparameters
+    parser.add_argument('--latent_dim', type=int, default=64, help='Latent dimension size')
+    parser.add_argument('--hidden_dim', type=int, default=128, help='Decoder hidden dimension size')
+    parser.add_argument('--n_layers', type=int, default=5, help='Number of layers')
+    parser.add_argument('--scale', type=str, default="log", help='Scale')
+    parser.add_argument('--eta_min', type=float, default=1e-7, help='Learning rate annealing')
+    parser.add_argument('--val_split', type=float, default=0.15, help='Training testing split')
+
+
+
+
+
+    # --- 2. Parse Arguments and Run Training ---
+    args = parser.parse_args()
+
     print("=============================================")
     print("       HRTF Anthropometry Model Training     ")
     print("=============================================")
     print(f"Make sure 'hrtf_dataset.py' and 'model.py' are in the Python path.")
-    print(f"Make sure to update 'DATA_PATH' and 'ANTHROPOMETRY_DIM' in this script.")
     print("---------------------------------------------")
 
-    train()
+    train(args)
 

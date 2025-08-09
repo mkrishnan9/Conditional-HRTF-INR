@@ -4,15 +4,15 @@ import SOFAdatasets
 from tqdm import tqdm
 
 
-out_dir = "/data2/neil/HRTF/prepocessed_hrirs"
-
+out_dir = "/export/mkrishn9/hrtf_field/prepocessed_hrirs"
 
 def save_hrir_as_pkl():
     dataset_dict = {"ari": "ARI", "hutubs": "HUTUBS", "ita": "ITA", "cipic": "CIPIC",
                     "3d3a": "Prin3D3A", "riec": "RIEC", "bili": "BiLi",
                     "listen": "Listen", "crossmod": "Crossmod", "sadie": "SADIE"}
+    dataset_dict = {"hutubs": "HUTUBS"}
     for name in list(dataset_dict.keys()):
-        # name = "riec"
+        #name = "riec"
         print(name)
         dataset_obj = getattr(SOFAdatasets, dataset_dict[name])()
         for idx in tqdm(range(len(dataset_obj))):
