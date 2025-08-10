@@ -381,9 +381,6 @@ def train(args):
 
     # --- Subject-Aware Splitting Logic ---
     subjects = {}
-    print("Mapping subjects to registry indices for splitting...")
-    registry_to_subject_id = {}
-    unique_subject_keys = []
     for i, file_path in enumerate(merged_dataset.file_registry):
         base_name = os.path.basename(file_path)
         match = re.match(r"([a-zA-Z0-9]+)_(\d+).pkl", base_name)
@@ -391,16 +388,57 @@ def train(args):
         dataset_name, file_num = match.group(1), int(match.group(2))
         subject_id_in_dataset = file_num // 2
         subject_key = (dataset_name, subject_id_in_dataset)
+        if subject_key not in subjects:
+            subjects[subject_key] = []
+        subjects[subject_key].append(i)
 
-        if subject_key not in unique_subject_keys:
-            unique_subject_keys.append(subject_key)
+    # Now, separate indices and create groups for the 'other' subjects
+    chedar_indices = []
+    other_indices = []
+    other_groups = []
+    other_subject_keys = [] # Used to assign a unique integer ID to each 'other' subject
 
-        # Map the dataset index 'i' to the index of its subject_key
-        subject_idx = unique_subject_keys.index(subject_key)
-        registry_to_subject_id[i] = subject_idx
+    for subject_key, indices in subjects.items():
+        if subject_key[0] == 'chedar':
+            chedar_indices.extend(indices)
+        else:
+            other_indices.extend(indices)
+            if subject_key not in other_subject_keys:
+                other_subject_keys.append(subject_key)
+            subject_id = other_subject_keys.index(subject_key)
 
-    indices = np.arange(len(merged_dataset))
-    groups = np.array([registry_to_subject_id[i] for i in indices])
+            # The 'groups' array must be the same length as the data being split
+            other_groups.extend([subject_id] * len(indices))
+
+    # Convert to numpy arrays for sklearn compatibility and indexing
+    chedar_indices = np.array(chedar_indices)
+    other_indices = np.array(other_indices)
+    other_groups = np.array(other_groups)
+
+    print(f"Found {len(chedar_indices)} samples for training ('chedar').")
+    print(f"Found {len(other_indices)} samples from {len(other_subject_keys)} subjects for K-fold cross-validation.")
+
+
+    # print("Mapping subjects to registry indices for splitting...")
+    # registry_to_subject_id = {}
+    # unique_subject_keys = []
+    # for i, file_path in enumerate(merged_dataset.file_registry):
+    #     base_name = os.path.basename(file_path)
+    #     match = re.match(r"([a-zA-Z0-9]+)_(\d+).pkl", base_name)
+    #     if not match: continue
+    #     dataset_name, file_num = match.group(1), int(match.group(2))
+    #     subject_id_in_dataset = file_num // 2
+    #     subject_key = (dataset_name, subject_id_in_dataset)
+
+    #     if subject_key not in unique_subject_keys:
+    #         unique_subject_keys.append(subject_key)
+
+    #     # Map the dataset index 'i' to the index of its subject_key
+    #     subject_idx = unique_subject_keys.index(subject_key)
+    #     registry_to_subject_id[i] = subject_idx
+
+    # indices = np.arange(len(merged_dataset))
+    # groups = np.array([registry_to_subject_id[i] for i in indices])
 
     N_SPLITS = 5 # A common choice
     kfold = GroupKFold(n_splits=N_SPLITS)
@@ -408,19 +446,37 @@ def train(args):
     fold_results = []
     fold_lsd = []
 
+    other_data_splits = kfold.split(other_indices, groups=other_groups)
+
 
     print(f"\nStarting {N_SPLITS}-Fold Cross-Validation...")
 
-    for fold, (train_indices, val_indices) in enumerate(kfold.split(indices, groups=groups)):
+    # for fold, (train_indices, val_indices) in enumerate(kfold.split(indices, groups=groups)):
+    #     print("-" * 50)
+    #     print(f"Fold {fold+1}/{N_SPLITS}")
+    #     print("-" * 50)
+
+    #     # --- Create Subsets and DataLoaders ---
+    #     train_subset = Subset(merged_dataset, train_indices)
+    #     val_subset = Subset(merged_dataset, val_indices)
+    for fold, (train_other_idx, val_other_idx) in enumerate(other_data_splits):
         print("-" * 50)
         print(f"Fold {fold+1}/{N_SPLITS}")
         print("-" * 50)
 
-        # --- Create Subsets and DataLoaders ---
+        # Get the actual validation indices from the original dataset
+        val_indices = other_indices[val_other_idx]
+
+        # Get the training indices from the 'other' split part
+        train_indices_from_split = other_indices[train_other_idx]
+
+        # The final training set is the 'chedar' data + the training split from 'other' data
+        train_indices = np.concatenate([chedar_indices, train_indices_from_split])
+
+        print(f"  Total Training samples: {len(train_indices)}")
+        print(f"  Validation samples: {len(val_indices)}")
         train_subset = Subset(merged_dataset, train_indices)
         val_subset = Subset(merged_dataset, val_indices)
-
-
 
         try:
             anthro_mean, anthro_std = calculate_anthro_stats(train_subset)
