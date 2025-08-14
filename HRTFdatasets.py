@@ -10,11 +10,15 @@ import pandas as pd
 import scipy.signal
 import random
 
+### What is marked "old" is from the HRTFField paper. The new versions of HRTFDataset work for a single dataset. Merged works for all.
+### HRTFDataset is a bit outdated. Please use Merged.
+
+
 def get_itd_from_anthro(anthro_vector, source_azimuth, head_width_idx=0, speed_of_sound=343.0):
     """Calculates ITD based on a spherical head model."""
     head_radius = (anthro_vector[head_width_idx] / 100) / 2
     azimuth_rad = np.deg2rad(source_azimuth)
-    # Woodworth/Schlosberg formula
+    # I think this is called Woodworth/Schlosberg formula
     itd = (head_radius / speed_of_sound) * (azimuth_rad + np.sin(azimuth_rad))
     return itd
 
@@ -27,7 +31,7 @@ def apply_itd_shift(hrir, shift_in_seconds, sample_rate):
 
 
 
-class old_HRTFDataset(Dataset):
+class oldHRTFDataset(Dataset):
     def __init__(self, dataset="hutubs", freq="all", scale="linear", norm_way=0):
         ## assert dataset is one of HRTFDataset
         dataset_dict = {"ari": "ARI", "hutubs": "HUTUBS", "ita": "ITA", "cipic": "CIPIC",
@@ -430,7 +434,7 @@ class MergedHRTFDataset(Dataset):
     """
     def __init__(self, dataset_names, preprocessed_dir,
                  augment=False, aug_prob=0.6,
-                 freq="all", scale="linear", norm_way=4):
+                 freq="all", scale="linear", norm_way=2):
 
         print("Initializing MergedHRTFDataset...")
         self.dataset_names = dataset_names
@@ -466,9 +470,9 @@ class MergedHRTFDataset(Dataset):
 
             all_anthros_stacked = torch.stack(all_anthros, dim=0)
 
-            # This is now calculated from the entire population (HUTUBS, CIPIC, etc.)
-            self.d3_mean = torch.mean(all_anthros_stacked[:, 11]).item() # d3 at index 15 ###HARDCODED
-            self.d3_std = torch.std(all_anthros_stacked[:, 11]).item()  ###HARDCODED
+
+            self.d3_mean = torch.mean(all_anthros_stacked[:, 11]).item() # d3 (width ear scale) at index 15 ###HARDCODED
+            self.d3_std = torch.std(all_anthros_stacked[:, 11]).item()  ###HARDCODED d3
             print(f"Global d3 distribution: mean={self.d3_mean:.2f}, std={self.d3_std:.2f}")
 
     def __len__(self):
@@ -483,7 +487,7 @@ class MergedHRTFDataset(Dataset):
 
     def _augment_hrir(self, hrir, anthro,locations):
         """ Applies augmentation using the globally calculated statistics. """
-        original_d3_val = anthro[11] #anthro[15] ### HARDCODED
+        original_d3_val = anthro[11]  ### HARDCODED
 
         min_val = self.d3_mean - 3 * self.d3_std
         max_val = self.d3_mean + 3 * self.d3_std
@@ -492,8 +496,8 @@ class MergedHRTFDataset(Dataset):
         scale_factor = target_d3_val / original_d3_val if original_d3_val != 0 else 1.0
         augmented_anthro = anthro.copy()
 
-        # Scale all distance-based anthropometric features
-        distance_indices = list(range(9, 17)) #list(range(19)) #list(range(23)) ### HARDCODED
+        # Scale all distance-based ear features
+        distance_indices = list(range(9, 17)) #list(range(19)) ### HARDCODED 9-17 is ear features in anthropometry, 1-8 is head/torso measurements.
         for i in distance_indices:
             augmented_anthro[i] *= scale_factor
 
@@ -520,18 +524,13 @@ class MergedHRTFDataset(Dataset):
         """ Converts HRIR to HRTF and applies normalization/scaling. """
         tf = np.abs(np.fft.fft(hrir, n=256))
         hrtf_np = tf[:, 1:93]
-        if self.scale == "linear":
-            hrtf_np = hrtf_np
-        if self.scale == "log":
-            hrtf_np = 20 * np.log10(hrtf_np + 1e-9)
-
 
 
 
         if self.norm_way == 0:
             max_val = np.max((hrtf_np))
             if max_val > 1e-9: hrtf_np = hrtf_np / max_val
-       ## second way is to devide by top 5% top value
+       ## second way is to divide by top 5% top value
         elif self.norm_way == 1:
             mag_flatten = hrtf_np.flatten()
             max_mag = np.mean(sorted(mag_flatten)[-int(mag_flatten.shape[0] / 20):])
@@ -539,11 +538,11 @@ class MergedHRTFDataset(Dataset):
         ## third way is to compute total energy of the equator
         elif self.norm_way == 2:
             equator_index = np.where(np.logical_and(location[:, 1] > -1, location[:, 1] <= 0))
-            tf_equator = tf[equator_index]
+            hrtf_equator = hrtf_np[equator_index]
             equator_azi = location[equator_index, 0][0]
             new_equator_index = np.argsort(equator_azi)
             new_equator_azi = equator_azi[new_equator_index]
-            new_equator_tf = tf_equator[new_equator_index]
+            new_equator_tf = hrtf_equator[new_equator_index]
 
             total_energy = 0
             for x in range(len(new_equator_index)):
@@ -553,11 +552,12 @@ class MergedHRTFDataset(Dataset):
                 else:
                     d_azi = new_equator_azi[x] - new_equator_azi[x - 1]
                 total_energy += np.square(new_equator_tf[x]).mean() * d_azi
-            tf = tf / np.sqrt(total_energy / 360)
+            hrtf_np = hrtf_np / np.sqrt(total_energy / 360)
         elif self.norm_way == 4:
-            max_val = 20 #np.max(hrtf_np)
-            min_val =  -100 #np.min(hrtf_np)
-            hrtf_np = 2* (hrtf_np-min_val)/(max_val-min_val) -1
+            if self.scale == 'log':
+                max_val = 20 #np.max(hrtf_np)
+                min_val =  -100 #np.min(hrtf_np)
+                hrtf_np = 2* (hrtf_np-min_val)/(max_val-min_val) -1
         #     # print(np.sqrt(total_energy / 360))
         # ## fourth way is to normalize on common locations
         # ## [(0.0, 0.0), (180.0, 0.0), (210.0, 0.0), (330.0, 0.0), (30.0, 0.0), (150.0, 0.0)]
@@ -570,10 +570,13 @@ class MergedHRTFDataset(Dataset):
         #     # print(mean_energy)
         #     tf = tf / mean_energy
 
-
-
-
-
+        if self.scale == "linear":
+            hrtf_np = hrtf_np
+        if self.scale == "log":
+            hrtf_np = 20 * np.log10(hrtf_np + 1e-9)
+            max_val = 15 #np.max(hrtf_np)                           #Max HRTF value after normalizing based on equation energy (norm_way=2)
+            min_val =  -85 #np.min(hrtf_np)                         #Min HRTF value after normalizing based on equation energy (norm_way=2)
+            hrtf_np = 2* (hrtf_np-min_val)/(max_val-min_val) -1     ## Normalize to (-1,1)
 
         return hrtf_np
 

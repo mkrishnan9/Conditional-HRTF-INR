@@ -1,5 +1,5 @@
 
-# This code is the implementation of the DiGS model and loss functions
+# This code is based on the implementation of the DiGS model and loss functions
 # It was partly based on SIREN and SAL implementation and architecture but with several significant modifications.
 # for the original SIREN version see: https://github.com/vsitzmann/siren
 # for the original SAL version see: https://github.com/matanatz/SAL
@@ -15,25 +15,214 @@ from torchmeta.modules.container import MetaSequential
 from torchmeta.modules.utils import get_subdict
 from collections import OrderedDict
 
-class AnthropometryEncoder(nn.Module):
-    def __init__(self, input_dim, latent_dim, hidden_dims=[64, 64]):
+################################# New Conditioning Methods #################################
+
+
+
+
+class PositionalEncoder(nn.Module):
+    """
+    A module to apply sinusoidal positional encoding to input coordinates.
+    """
+    def __init__(self, d_input: int, n_freqs: int):
         super().__init__()
-        layers = []
-        prev_dim = input_dim
-        for h in hidden_dims:
-            layers.append(nn.Linear(prev_dim, h))
-            layers.append(nn.ReLU())
-            prev_dim = h
-        layers.append(nn.Linear(prev_dim, latent_dim))
-        self.encoder = nn.Sequential(*layers)
+        self.d_input = d_input
+        self.n_freqs = n_freqs
+        self.d_output = d_input * (2 * n_freqs)
 
-    def forward(self, x):
-        return self.encoder(x)
+        # Create a buffer for frequency bands that is not a model parameter
+        freq_bands = 2.**torch.linspace(0., n_freqs - 1, n_freqs)
+        self.register_buffer('freq_bands', freq_bands)
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies positional encoding to the input tensor.
+        Args:
+            x: Input tensor of shape (..., d_input)
+        Returns:
+            Encoded tensor of shape (..., d_output)
+        """
+        # Project input coordinates onto frequency bands
+        # Shape: (..., d_input, n_freqs)
+        x_proj = x.unsqueeze(-1) * self.freq_bands
+
+        # Concatenate sine and cosine transformations
+        # Shape: (..., d_input * 2 * n_freqs)
+        x_encoded = torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
+
+        return x_encoded.reshape(*x.shape[:-1], self.d_output)
+
+
+class CondHRTFNetwork(nn.Module):
+    """
+    An INR for HRTFs, conditioned on anthropometry using an MLP.
+
+    This network follows the Attn> Concatenation paper's best-practice for MLP conditioning:
+    1. It uses an embedding network to create a latent vector `z` from anthropometry.
+    2. It splits `z` into N chunks.
+    3. It concatenates each chunk to the input of one of the N hidden layers of the main INR.
+    Note: Embedding layer dimensions are fixed at 256. Need to add them as an argument.
+    """
+    def __init__(self,
+                 d_anthro_in: int = 19,
+                 d_latent: int = 256,
+                 d_inr_hidden: int = 256,
+                 n_inr_layers: int = 4,
+                 d_inr_out: int = 92,
+                 n_freqs: int = 10,
+                 d_embed_hidden = 256,
+                 d_inr_in = 2):
+        super().__init__()
+
+        self.d_inr_in = d_inr_in # Azimuth and Elevation
+        self.d_latent = d_latent
+        self.n_inr_layers = n_inr_layers
+
+        # Ensure the latent vector can be split evenly among the layers
+        assert d_latent % n_inr_layers == 0, \
+            "Latent dimension (d_latent) must be divisible by number of layers (n_inr_layers)."
+        self.d_latent_split = d_latent // n_inr_layers
+
+        # 1. Positional Encoder for coordinates (azi, ele)
+        self.positional_encoder = PositionalEncoder(self.d_inr_in, n_freqs)
+        d_pe_out = self.positional_encoder.d_output
+
+        # 2. Embedding network to convert anthropometry to a latent vector `z`
+        self.embedding_net = nn.Sequential(
+            nn.Linear(d_anthro_in, 256),
+            nn.ReLU(),
+            nn.Linear(256,256),
+            nn.ReLU(),
+            nn.Linear(256, d_latent)
+        )
+
+        # 3. Main INR network with layer-wise conditioning
+        self.main_inr_net = nn.ModuleList()
+
+        # First layer
+        self.main_inr_net.append(
+            nn.Linear(d_pe_out + self.d_latent_split, d_inr_hidden)
+        )
+
+        # Hidden layers
+        for _ in range(n_inr_layers - 1):
+            self.main_inr_net.append(
+                nn.Linear(d_inr_hidden + self.d_latent_split, d_inr_hidden)
+            )
+
+        # Output layer
+        self.output_layer = nn.Linear(d_inr_hidden, d_inr_out)
+
+    def forward(self, coords: torch.Tensor, anthropometry: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the forward pass.
+        Args:
+            coords: A tensor of (azimuth, elevation) coordinates, shape (B, 2).
+            anthropometry: A tensor of anthropometric data, shape (B, d_anthro_in).
+        Returns:
+            A tensor of HRTF values (e.g., mag, phase), shape (B, d_inr_out).
+        """
+        # 1. Generate the latent vector `z` from anthropometry
+        z = self.embedding_net(anthropometry)
+
+        # 2. Split `z` into one chunk per layer
+        z_splits = torch.chunk(z, self.n_inr_layers, dim=-1)
+
+        # 3. Apply positional encoding to coordinates
+        x = self.positional_encoder(coords)
+
+        # 4. Pass through the main network, conditioning each layer
+        for i, layer in enumerate(self.main_inr_net):
+            # Concatenate the signal with the i-th chunk of the latent vector
+            x = torch.cat([x, z_splits[i]], dim=-1)
+            x = torch.relu(layer(x))
+
+        # 5. Final output layer
+        output = self.output_layer(x)
+        return output
+
+
+##To prevent overfitting, tried adding dropout to the CondHRTFNetwork class. Not sure if I did it right.
+
+class CondHRTFNetwork_with_Dropout(nn.Module):
+    """
+    An INR for HRTFs with dropout for regularization.
+
+    This version adds dropout layers to:
+    1. The embedding network that creates the latent vector `z`.
+    2. The main INR network's hidden layers.
+    """
+    def __init__(self,
+                 d_anthro_in: int = 19,
+                 d_latent: int = 256,
+                 d_inr_hidden: int = 256,
+                 n_inr_layers: int = 4,
+                 d_inr_out: int = 92,
+                 n_freqs: int = 10,
+                 dropout_rate: float = 0.5): # <-- New parameter for dropout
+        super().__init__()
+
+        self.d_inr_in = 2 # Azimuth and Elevation
+        self.d_latent = d_latent
+        self.n_inr_layers = n_inr_layers
+
+        # Ensure latent vector can be split evenly
+        assert d_latent % n_inr_layers == 0, \
+            "Latent dimension (d_latent) must be divisible by number of layers (n_inr_layers)."
+        self.d_latent_split = d_latent // n_inr_layers
+
+        # 1. Positional Encoder
+        self.positional_encoder = PositionalEncoder(self.d_inr_in, n_freqs)
+        d_pe_out = self.positional_encoder.d_output
+
+        # 2. Embedding network with dropout
+        self.embedding_net = nn.Sequential(
+            nn.Linear(d_anthro_in, 256),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(256, d_latent)
+        )
+
+        # 3. Main INR network
+        self.main_inr_net = nn.ModuleList()
+
+        # First layer
+        self.main_inr_net.append(
+            nn.Linear(d_pe_out + self.d_latent_split, d_inr_hidden)
+        )
+
+        # Hidden layers
+        for _ in range(n_inr_layers - 1):
+            self.main_inr_net.append(
+                nn.Linear(d_inr_hidden + self.d_latent_split, d_inr_hidden)
+            )
+
+        # Output layer
+        self.output_layer = nn.Linear(d_inr_hidden, d_inr_out)
+
+        # 4. Dropout layer for the main INR network
+        self.inr_dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, coords: torch.Tensor, anthropometry: torch.Tensor) -> torch.Tensor:
+        z = self.embedding_net(anthropometry)
+        z_splits = torch.chunk(z, self.n_inr_layers, dim=-1)
+        x = self.positional_encoder(coords)
+        for i, layer in enumerate(self.main_inr_net):
+            x = torch.cat([x, z_splits[i]], dim=-1)
+            x = torch.relu(layer(x))
+            x = self.inr_dropout(x) # <-- Dropout applied
+
+
+        output = self.output_layer(x)
+        return output
+
+## Tried adding convolutional layer to understand relationship across frequencies for the R^92 output vector.
 class Conv1DRefiner(nn.Module):
     def __init__(self, embed_dim, num_layers=3, kernel_size=3):
         super().__init__()
-        # Ensure padding is set to keep the sequence length the same
         padding = (kernel_size - 1) // 2
 
         layers = []
@@ -41,14 +230,12 @@ class Conv1DRefiner(nn.Module):
             layers.append(nn.Conv1d(in_channels=embed_dim, out_channels=embed_dim,
                                     kernel_size=kernel_size, padding=padding))
             layers.append(nn.GELU())
-            layers.append(nn.LayerNorm([embed_dim, 92])) # Norm over feature and sequence dims
+            layers.append(nn.LayerNorm([embed_dim, 92])) ##92 Frequency bins
 
         self.refiner = nn.Sequential(*layers)
 
     def forward(self, x):
         # x shape: (batch, seq_len, embed_dim) -> (N, 92, 32)
-
-        # Conv1d expects (batch, channels, seq_len), so we permute the dimensions
         x = x.permute(0, 2, 1) # -> (N, 32, 92)
 
         refined_x = self.refiner(x)
@@ -57,470 +244,292 @@ class Conv1DRefiner(nn.Module):
         refined_x = refined_x.permute(0, 2, 1) # -> (N, 92, 32)
         return refined_x
 
-class SelfAttentionBlock(nn.Module):
-    """ A standard Transformer self-attention block. """
-    def __init__(self, embed_dim, num_heads):
-        super().__init__()
-        # Note: batch_first=True is crucial for our tensor shapes
-        self.attention = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 4),
-            nn.GELU(), # GELU is often used in modern transformers
-            nn.Linear(embed_dim * 4, embed_dim),
-        )
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
 
-    def forward(self, x):
-        # x shape: (batch_size, sequence_length, embed_dim)
-        # Self-attention: query, key, and value are all `x`
-        attn_output, _ = self.attention(x, x, x)
-        # First residual connection
+
+class CondHRTFNetwork_conv(nn.Module):
+    """
+    An INR for HRTFs that uses a "refinement" architecture.
+    An MLP backbone predicts a feature vector for each frequency, which is then
+    refined by a 1D CNN before final projection.
+    """
+    def __init__(self,
+                 d_anthro_in: int = 19,
+                 d_latent: int = 256,
+                 d_inr_hidden: int = 256,
+                 n_inr_layers: int = 4,
+                 d_inr_out: int = 92, # This is now the sequence length
+                 n_freqs: int = 10,
+                 d_freq_embed: int = 16): # New: Dimension for each frequency's feature vector
+        super().__init__()
+
+        self.d_inr_in = 2
+        self.d_latent = d_latent
+        self.n_inr_layers = n_inr_layers
+        self.d_inr_out = d_inr_out
+        self.d_freq_embed = d_freq_embed
+
+        assert d_latent % n_inr_layers == 0, \
+            "Latent dimension must be divisible by number of layers."
+        self.d_latent_split = d_latent // n_inr_layers
+
+        self.positional_encoder = PositionalEncoder(self.d_inr_in, n_freqs)
+        d_pe_out = self.positional_encoder.d_output
+
+        self.embedding_net = nn.Sequential(
+            nn.Linear(d_anthro_in, 256), nn.ReLU(),
+            nn.Linear(256,256), nn.ReLU(),
+            nn.Linear(256, d_latent)
+        )
+
+
+        self.main_inr_net = nn.ModuleList()
+        self.main_inr_net.append(nn.Linear(d_pe_out + self.d_latent_split, d_inr_hidden))
+        for _ in range(n_inr_layers - 1):
+            self.main_inr_net.append(nn.Linear(d_inr_hidden + self.d_latent_split, d_inr_hidden))
+
+
+
+        # This predicts a feature vector for every frequency bin.
+        self.initial_predictor = nn.Linear(d_inr_hidden, d_inr_out * d_freq_embed)
+
+        # Convolutional Refiner
+        self.refiner = Conv1DRefiner(embed_dim=d_freq_embed, num_layers=3, kernel_size=7)
+
+        # This small MLP maps each refined feature vector to a single output value.
+        self.final_head = nn.Sequential(
+            nn.Linear(d_freq_embed, d_freq_embed // 2),
+            nn.GELU(),
+            nn.Linear(d_freq_embed // 2, 1)
+        )
+
+    def forward(self, coords: torch.Tensor, anthropometry: torch.Tensor) -> torch.Tensor:
+        batch_size = coords.shape[0]
+
+
+        z = self.embedding_net(anthropometry)
+        z_splits = torch.chunk(z, self.n_inr_layers, dim=-1)
+        x_pe = self.positional_encoder(coords)
+        x = x_pe
+        for i, layer in enumerate(self.main_inr_net):
+            x = torch.cat([x, z_splits[i]], dim=-1)
+            x = torch.relu(layer(x))
+
+        x = self.initial_predictor(x)
+        x = x.view(batch_size, self.d_inr_out, self.d_freq_embed)
+
+
+        x = self.refiner(x)
+
+
+        output = self.final_head(x)
+
+
+        return output.squeeze(-1)
+
+########FiLM for conditioning###########
+
+class FiLMLayer(nn.Module):
+    """
+    A single layer that applies Feature-wise Linear Modulation.
+    It is modulated by gamma/beta parameters.
+    """
+    def __init__(self, d_in: int, d_out: int):
+        super().__init__()
+        self.layer = nn.Linear(d_in, d_out)
+
+    def forward(self, x: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+        """
+        Applies the FiLM operation.
+        Args:
+            x: The main signal tensor.
+            gamma: The scale parameter tensor.
+            beta: The shift parameter tensor.
+        """
+        x = self.layer(x)
+        return gamma * x + beta
+
+
+class CondHRTFNetwork_FiLM(nn.Module):
+
+    def __init__(self,
+                 d_anthro_in: int = 15,
+                 d_latent: int = 512,
+                 d_inr_hidden: int = 256,
+                 n_inr_layers: int = 8,
+                 d_inr_out: int = 92,
+                 n_freqs: int = 10):
+        super().__init__()
+
+        self.d_inr_in = 2
+        self.n_inr_layers = n_inr_layers
+        assert d_latent % n_inr_layers == 0, \
+            "Latent dimension (d_latent) must be divisible by number of layers (n_inr_layers)."
+        self.d_latent_split = d_latent // n_inr_layers
+
+        self.positional_encoder = PositionalEncoder(self.d_inr_in, n_freqs)
+        d_pe_out = self.positional_encoder.d_output
+
+
+        self.embedding_net = nn.Sequential(
+            nn.Linear(d_anthro_in, 128), nn.ReLU(),
+            nn.Linear(128,128), nn.ReLU(),
+            nn.Linear(128, d_latent)
+        )
+
+
+        self.main_inr_net = nn.ModuleList()
+        self.main_inr_net.append(FiLMLayer(d_pe_out, d_inr_hidden))
+        for _ in range(n_inr_layers - 1):
+            self.main_inr_net.append(FiLMLayer(d_inr_hidden, d_inr_hidden))
+
+
+        self.film_generator = nn.ModuleList()
+        for _ in range(n_inr_layers):
+            self.film_generator.append(
+                nn.Sequential(
+                    nn.Linear(self.d_latent_split, 128),
+                    nn.ReLU(),
+                    nn.Linear(128, d_inr_hidden * 2)
+                )
+            )
+
+
+        self.output_layer = nn.Linear(d_inr_hidden, d_inr_out)
+
+    def forward(self, coords: torch.Tensor, anthropometry: torch.Tensor) -> torch.Tensor:
+
+        z = self.embedding_net(anthropometry)
+        z_splits = torch.chunk(z, self.n_inr_layers, dim=-1)
+        x = self.positional_encoder(coords)
+
+        for i, film_layer in enumerate(self.main_inr_net):
+            gamma_beta = self.film_generator[i](z_splits[i])
+            gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
+            x = film_layer(x, gamma, beta)
+            x = torch.relu(x)
+
+
+        output = self.output_layer(x)
+        return output
+
+
+#########Cross-attention Conditioning#####
+
+class CrossAttentionStage(nn.Module):
+    """
+    A single stage of the attention-based decoder, as described in the paper.
+    It consists of a cross-attention layer followed by a multi-layer perceptron (MLP),
+    [cite_start]with skip connections and layer normalization. [cite: 555]
+    """
+    def __init__(self, d_model: int, n_heads: int, d_mlp: int):
+        super().__init__()
+
+
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            batch_first=True
+        )
+
+        #3-layer MLP that follows the attention layer
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_mlp),
+            nn.ReLU(),
+            nn.Linear(d_mlp, d_mlp),
+            nn.ReLU(),
+            nn.Linear(d_mlp, d_model)
+        )
+
+        # Layer normalization, applied after skip connections
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): The main signal tensor (query), from coordinates. Shape: [batch, n_coords, d_model]
+            z (torch.Tensor): The set-latent conditioning tensor (key, value). Shape: [batch, n_tokens, d_token]
+        """
+        #  Cross-Attention
+        # The query is derived from the coordinates.
+        # key and value are derived from the set-latent tokens (z).
+        attn_output, _ = self.cross_attention(query=x, key=z, value=z)
+
+        #Skip connection and normalization
         x = self.norm1(x + attn_output)
-        # Second residual connection
-        ffn_output = self.ffn(x)
-        x = self.norm2(x + ffn_output)
+
+        # MLP
+        mlp_output = self.mlp(x)
+
+        #Second skip connection and normalization
+        x = self.norm2(x + mlp_output)
+
         return x
 
 
-
-class CrossAttentionEncoder(nn.Module):
-
-    def __init__(self, query_dim, context_dim, latent_dim, num_heads=8):
+class CondHRTFNetwork_Attention(nn.Module):
+    """
+    Full attention-based neural field, conditioned on a set-latent representation.
+    """
+    def __init__(self,
+                 d_anthro_in: int = 15,
+                 d_model: int = 128,
+                 d_mlp: int = 256,
+                 d_inr_out: int = 92,
+                 n_freqs: int = 10,
+                 n_stages: int = 3,
+                 n_heads: int = 8,
+                 n_tokens: int = 16):
         super().__init__()
-        # Ensure latent_dim is divisible by num_heads for MultiheadAttention
-        if latent_dim % num_heads != 0:
-            raise ValueError(f"'latent_dim' ({latent_dim}) must be divisible by 'num_heads' ({num_heads}).")
 
-        self.embed_dim = latent_dim  # The core dimension for the attention mechanism
+        self.d_inr_in = 2 # 2D coordinates (e.g., azimuth, elevation)
+        self.n_tokens = n_tokens
+        self.d_model = d_model
 
-        # The multi-head attention layer
-        self.attention = nn.MultiheadAttention(
-            embed_dim=self.embed_dim,
-            num_heads=num_heads,
-            batch_first=True  # We use (batch, seq, feature) format
-        )
+        # 1. Positional Encoder for coordinates
+        self.positional_encoder = PositionalEncoder(self.d_inr_in, n_freqs)
+        d_pe_out = self.positional_encoder.d_output
 
-        # Linear layers to project input and context to the attention's embedding dimension
-        self.query_proj = nn.Linear(query_dim, self.embed_dim)
-        self.context_proj = nn.Linear(context_dim, self.embed_dim)
+        # Layer to project positional encoding to the model's dimension
+        self.coord_projection = nn.Linear(d_pe_out, d_model)
 
-        # A standard feed-forward network after attention
-        self.ffn = nn.Sequential(
-            nn.Linear(self.embed_dim, self.embed_dim * 4),
+        # 2. Embedding network to generate the set-latent vector `z`
+        self.embedding_net = nn.Sequential(
+            nn.Linear(d_anthro_in, 512),
             nn.ReLU(),
-            nn.Linear(self.embed_dim * 4, self.embed_dim)
+            nn.Linear(512, self.n_tokens * self.d_model) # Output enough values for all tokens
         )
 
-        # Layer normalization for stabilizing training
-        self.norm1 = nn.LayerNorm(self.embed_dim)
-        self.norm2 = nn.LayerNorm(self.embed_dim)
+        # main network, composed of multiple attention stages
+        self.attention_stages = nn.ModuleList(
+            [CrossAttentionStage(d_model, n_heads, d_mlp) for _ in range(n_stages)]
+        )
 
-    def forward(self, query_in, context_in):
-        """
-        Forward pass for the cross-attention encoder.
-        - query_in: The primary input tensor (query). Shape: (batch_size, query_dim)
-        - context_in: The context tensor. Shape: (batch_size, context_dim)
-        """
-        # Reshape vectors to sequences of length 1
-        if query_in.dim() == 2:
-            query_seq = query_in.unsqueeze(1)
-        if context_in.dim() == 2:
-            context_seq = context_in.unsqueeze(1)
+        #Final output layer
+        self.output_layer = nn.Linear(d_model, d_inr_out)
 
-        # Project inputs to the embedding dimension
-        query = self.query_proj(query_seq)
-        key = self.context_proj(context_seq)
-        value = self.context_proj(context_seq)
+    def forward(self, coords: torch.Tensor, anthropometry: torch.Tensor) -> torch.Tensor:
+        z_flat = self.embedding_net(anthropometry)
+        z = z_flat.view(-1, self.n_tokens, self.d_model)
+        x_pe = self.positional_encoder(coords)
+        batch_size = z.shape[0]
+        total_coords = coords.shape[0]
+        n_locations = total_coords // batch_size
+        x = self.coord_projection(x_pe)
 
-        # Apply cross-attention
-        attn_output, _ = self.attention(query=query, key=key, value=value)
 
-        # First residual connection and normalization
-        x_res = self.norm1(query + attn_output)
+        # This ensures x has the shape (batch_size, n_locations, d_model)
+        if x.dim() == 2:
+            x = x.view(batch_size, n_locations, self.d_model)
 
-        # Feed-forward network
-        ffn_output = self.ffn(x_res)
+        for stage in self.attention_stages:
+            x = stage(x, z)
 
-        # Second residual connection and normalization
-        processed_output = self.norm2(x_res + ffn_output)
-
-        # Squeeze the sequence dimension to get the final vector
-        output = processed_output.squeeze(1)
+        output = self.output_layer(x)
         return output
 
 
-class CrossAttentionBlock(nn.Module):
-    # This is essentially your original module's core logic
-    def __init__(self, embed_dim, num_heads):
-        super().__init__()
-        self.attention = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 4),
-            nn.ReLU(),
-            nn.Linear(embed_dim * 4, embed_dim)
-        )
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
-
-    def forward(self, query, key, value):
-        # query: (batch, 1, embed_dim)
-        # key, value: (batch, 1, embed_dim)
-        attn_output, _ = self.attention(query, key, value)
-        x_res = self.norm1(query + attn_output)
-        ffn_output = self.ffn(x_res)
-        processed_output = self.norm2(x_res + ffn_output)
-        return processed_output
-
-
-
-class StackedCrossAttentionEncoder(nn.Module):
-    def __init__(self, query_dim, context_dim, latent_dim, num_heads=8, num_layers=4):
-        super().__init__()
-        self.embed_dim = latent_dim
-        # Project inputs once at the beginning
-        self.query_proj = nn.Linear(query_dim, self.embed_dim)
-        self.context_proj = nn.Linear(context_dim, self.embed_dim)
-
-        # Create a list of attention blocks
-        self.layers = nn.ModuleList(
-            [CrossAttentionBlock(self.embed_dim, num_heads) for _ in range(num_layers)]
-        )
-
-    def forward(self, query_in, context_in):
-        # Reshape and project inputs
-        query = self.query_proj(query_in.unsqueeze(1))
-        context_seq = context_in.unsqueeze(1)
-        key = self.context_proj(context_seq)
-        value = self.context_proj(context_seq) # Or a separate projection for value
-
-        # Pass through all layers, updating the query each time
-        for layer in self.layers:
-            query = layer(query, key, value)
-
-        # Squeeze the sequence dimension
-        return query.squeeze(1)
-
-class HRTFNetwork(nn.Module):
-    # In HRTFNetwork class's __init__ method:
-
-    def __init__(self, anthropometry_dim, target_freq_dim, # Added target_freq_dim
-                latent_dim=32, num_heads=8, decoder_hidden_dim=128,
-                decoder_n_hidden_layers=4, init_type='siren', nonlinearity='sine'): # Removed target_freq_dim from here
-        super().__init__()
-        #self.encoder = AnthropometryEncoder(anthropometry_dim, latent_dim)
-        query_dim = 2
-        self.encoder = StackedCrossAttentionEncoder(
-            query_dim=query_dim,            # Input from az_el
-            context_dim=anthropometry_dim,  # Input from anthropometry data
-            latent_dim=latent_dim,
-            num_heads=num_heads,
-            num_layers=4
-        )
-
-        # Input to decoder: 2 (preprocessed az, el) + latent_dim
-        # Output features: Number of frequency bins to predict
-        self.decoder = FCBlock(
-            in_features=2 + latent_dim,
-            out_features=target_freq_dim, # Set output size to number of frequencies
-            num_hidden_layers=decoder_n_hidden_layers,
-            hidden_features=decoder_hidden_dim,
-            outermost_linear=True,
-            nonlinearity=nonlinearity,
-            init_type=init_type
-        )
-
-    def forward(self, az_el, anthropometry):
-        # az_el: (N, 2) -- azimuth and elevation
-        # anthropometry: (N, anthropometry_dim)
-        #latent = self.encoder(anthropometry)  # (N, latent_dim)
-        latent = self.encoder(query_in=az_el, context_in=anthropometry)
-        x = torch.cat([az_el, latent], dim=-1)  # (N, 2 + latent_dim)
-        return self.decoder(x)
-
-
-class HRTFNetwork_self(nn.Module):
-    def __init__(self,
-                 anthropometry_dim,
-                 target_freq_dim=92,
-                 latent_dim=64,
-                 num_heads=8,
-                 # --- NEW parameters for frequency attention ---
-                 freq_embed_dim=32,      # Feature dimension for each frequency
-                 freq_attn_layers=3,     # How many self-attention blocks to stack
-                 # --------------------------------------------
-                 decoder_hidden_dim=256,
-                 decoder_n_hidden_layers=4,
-                 init_type='siren',
-                 nonlinearity='sine'):
-        super().__init__()
-
-        # --- Store key dimensions for reshaping later ---
-        self.target_freq_dim = target_freq_dim
-        self.freq_embed_dim = freq_embed_dim
-        # ----------------------------------------------
-
-        # 1. ENCODER (no changes here)
-        # This part still produces a single latent vector conditioned on space and anthropometry.
-        query_dim = 2 # az_el
-        self.encoder = StackedCrossAttentionEncoder(
-            query_dim=query_dim,
-            context_dim=anthropometry_dim,
-            latent_dim=latent_dim,
-            num_heads=num_heads,
-            num_layers=4
-        )
-
-        # 2. INITIAL DECODER (repurposed)
-        # Instead of predicting final magnitudes, this MLP predicts the "raw" feature vectors
-        # for all frequencies at once.
-        self.initial_decoder = FCBlock(
-            in_features=2 + latent_dim, # Input is still conditioned latent code + original az_el
-            # NEW: Output enough features for all frequencies
-            out_features=target_freq_dim * freq_embed_dim,
-            num_hidden_layers=decoder_n_hidden_layers,
-            hidden_features=decoder_hidden_dim,
-            outermost_linear=True,
-            nonlinearity=nonlinearity,
-            init_type=init_type
-        )
-
-        # 3. FREQUENCY ATTENTION REFINER (new)
-        # This is a stack of self-attention blocks to process the sequence of frequencies.
-        self.frequency_refiner = nn.Sequential(
-            *[SelfAttentionBlock(freq_embed_dim, num_heads) for _ in range(freq_attn_layers)]
-        )
-
-        # 4. FINAL HEAD (new)
-        # This final small MLP projects each refined frequency feature vector to a single magnitude value.
-        self.final_head = nn.Sequential(
-            nn.Linear(freq_embed_dim, freq_embed_dim // 2),
-            nn.GELU(),
-            nn.Linear(freq_embed_dim // 2, 1)
-            # We don't add a final ReLU here, as it's often better to add it
-            # outside the model or use a loss function robust to raw outputs (logits).
-        )
-
-
-    def forward(self, az_el, anthropometry):
-        # az_el: (N, 2)
-        # anthropometry: (N, anthropometry_dim)
-        batch_size = az_el.shape[0]
-
-        # --- 1. Encoder ---
-        # Get the latent vector conditioned on spatial position and subject anthropometry.
-        latent = self.encoder(query_in=az_el, context_in=anthropometry) # Shape: (N, latent_dim)
-
-        # --- 2. Initial Decoder ---
-        # Prepare input for the decoder and generate raw frequency features.
-        x = torch.cat([az_el, latent], dim=-1) # Shape: (N, 2 + latent_dim)
-        raw_freq_features = self.initial_decoder(x) # Shape: (N, target_freq_dim * freq_embed_dim)
-
-        # --- 3. Reshape and Refine ---
-        # Reshape the flat output into a sequence for the attention module.
-        # This is the key step: we now treat frequencies as a sequence.
-        freq_sequence = raw_freq_features.view(
-            batch_size,
-            self.target_freq_dim,
-            self.freq_embed_dim
-        ) # Shape: (N, 92, 32)
-
-        # Pass the sequence through the self-attention blocks.
-        refined_sequence = self.frequency_refiner(freq_sequence) # Shape: (N, 92, 32)
-
-        # --- 4. Final Projection ---
-        # Project each refined frequency vector to its final magnitude.
-        magnitudes = self.final_head(refined_sequence) # Shape: (N, 92, 1)
-
-        # Squeeze the last dimension to get the desired output shape.
-        return magnitudes.squeeze(-1) # Final Shape: (N, 92)
-
-
-class HRTFNetwork_conv(nn.Module):
-    def __init__(self,
-                 anthropometry_dim,
-                 target_freq_dim=92,
-                 latent_dim=64,
-                 num_heads=8,
-                 # --- NEW parameters for frequency attention ---
-                 freq_embed_dim=32,
-                 # --------------------------------------------
-                 decoder_hidden_dim=256,
-                 decoder_n_hidden_layers=4,
-                 init_type='siren',
-                 nonlinearity='sine'):
-        super().__init__()
-
-        # --- Store key dimensions for reshaping later ---
-        self.target_freq_dim = target_freq_dim
-        self.freq_embed_dim = freq_embed_dim
-        # ----------------------------------------------
-
-        # 1. ENCODER (no changes here)
-        # This part still produces a single latent vector conditioned on space and anthropometry.
-        query_dim = 2 # az_el
-        self.encoder = StackedCrossAttentionEncoder(
-            query_dim=query_dim,
-            context_dim=anthropometry_dim,
-            latent_dim=latent_dim,
-            num_heads=num_heads,
-            num_layers=4
-        )
-
-        # 2. INITIAL DECODER (repurposed)
-        # Instead of predicting final magnitudes, this MLP predicts the "raw" feature vectors
-        # for all frequencies at once.
-        self.initial_decoder = FCBlock(
-            in_features=2 + latent_dim, # Input is still conditioned latent code + original az_el
-            # NEW: Output enough features for all frequencies
-            out_features=target_freq_dim * freq_embed_dim,
-            num_hidden_layers=decoder_n_hidden_layers,
-            hidden_features=decoder_hidden_dim,
-            outermost_linear=True,
-            nonlinearity=nonlinearity,
-            init_type=init_type
-        )
-
-
-        self.frequency_refiner = Conv1DRefiner(embed_dim=freq_embed_dim, num_layers=3, kernel_size=3)
-
-        # 4. FINAL HEAD (new)
-        # This final small MLP projects each refined frequency feature vector to a single magnitude value.
-        self.final_head = nn.Sequential(
-            nn.Linear(freq_embed_dim, freq_embed_dim // 2),
-            nn.GELU(),
-            nn.Linear(freq_embed_dim // 2, 1)
-            # We don't add a final ReLU here, as it's often better to add it
-            # outside the model or use a loss function robust to raw outputs (logits).
-        )
-
-
-    def forward(self, az_el, anthropometry):
-        # az_el: (N, 2)
-        # anthropometry: (N, anthropometry_dim)
-        batch_size = az_el.shape[0]
-
-        # --- 1. Encoder ---
-        # Get the latent vector conditioned on spatial position and subject anthropometry.
-        latent = self.encoder(query_in=az_el, context_in=anthropometry) # Shape: (N, latent_dim)
-
-        # --- 2. Initial Decoder ---
-        # Prepare input for the decoder and generate raw frequency features.
-        x = torch.cat([az_el, latent], dim=-1) # Shape: (N, 2 + latent_dim)
-        raw_freq_features = self.initial_decoder(x) # Shape: (N, target_freq_dim * freq_embed_dim)
-
-        # --- 3. Reshape and Refine ---
-        # Reshape the flat output into a sequence for the attention module.
-        # This is the key step: we now treat frequencies as a sequence.
-        freq_sequence = raw_freq_features.view(
-            batch_size,
-            self.target_freq_dim,
-            self.freq_embed_dim
-        ) # Shape: (N, 92, 32)
-
-        # Pass the sequence through the self-attention blocks.
-        refined_sequence = self.frequency_refiner(freq_sequence) # Shape: (N, 92, 32)
-
-        # --- 4. Final Projection ---
-        # Project each refined frequency vector to its final magnitude.
-        magnitudes = self.final_head(refined_sequence) # Shape: (N, 92, 1)
-
-        # Squeeze the last dimension to get the desired output shape.
-        return magnitudes.squeeze(-1) # Final Shape: (N, 92)
-
-
-
-
-class HRTFNetwork3D(nn.Module):
-    # In HRTFNetwork class's __init__ method:
-
-    def __init__(self, anthropometry_dim, target_freq_dim, # Added target_freq_dim
-                latent_dim=32, num_heads=8, decoder_hidden_dim=128,
-                decoder_n_hidden_layers=4, init_type='siren', nonlinearity='sine'): # Removed target_freq_dim from here
-        super().__init__()
-        #self.encoder = AnthropometryEncoder(anthropometry_dim, latent_dim)
-        query_dim = 3
-        self.encoder = StackedCrossAttentionEncoder(
-            query_dim=query_dim,            # Input from az_el
-            context_dim=anthropometry_dim,  # Input from anthropometry data
-            latent_dim=latent_dim,
-            num_heads=num_heads,
-            num_layers=4
-        )
-
-        # Input to decoder: 2 (preprocessed az, el) + latent_dim
-        # Output features: Number of frequency bins to predict
-        self.decoder = FCBlock(
-            in_features=3 + latent_dim,
-            out_features=target_freq_dim, # Set output size to number of frequencies
-            num_hidden_layers=decoder_n_hidden_layers,
-            hidden_features=decoder_hidden_dim,
-            outermost_linear=True,
-            nonlinearity=nonlinearity,
-            init_type=init_type
-        )
-
-    def forward(self, az_el, anthropometry):
-        # az_el: (N, 2) -- azimuth and elevation
-        # anthropometry: (N, anthropometry_dim)
-        #latent = self.encoder(anthropometry)  # (N, latent_dim)
-        latent = self.encoder(query_in=az_el, context_in=anthropometry)
-        x = torch.cat([az_el, latent], dim=-1)  # (N, 3 + latent_dim)
-        return self.decoder(x)
-
-class HRTFNetwork_film(nn.Module):
-    """
-    HRTF Network conditioned on anthropometry using FiLM layers.
-    """
-    def __init__(self, anthropometry_dim, target_freq_dim, latent_dim,
-                 decoder_hidden_dim=128, decoder_n_hidden_layers=4,
-                 init_type='siren', nonlinearity='sine'):
-        super().__init__()
-        self.decoder_hidden_dim = decoder_hidden_dim
-
-        # The number of layers we need to modulate is the input layer + all hidden layers
-        self.num_modulated_layers = decoder_n_hidden_layers + 1
-
-        # 1. The main network processes the azimuth and elevation
-        self.main_network = FiLMedFCBlock(
-            in_features=2,  # Input is (azimuth, elevation)
-            out_features=target_freq_dim,
-            num_hidden_layers=decoder_n_hidden_layers,
-            hidden_features=decoder_hidden_dim,
-            outermost_linear=True,
-            nonlinearity=nonlinearity,
-            init_type=init_type
-        )
-
-        # 2. The FiLM generator processes the anthropometric data
-        self.film_generator = FiLMGenerator(
-            cond_dim=anthropometry_dim,
-            num_modulated_layers=self.num_modulated_layers,
-            film_hidden_dim=decoder_hidden_dim
-        )
-
-    def forward(self, az_el, anthropometry):
-        # az_el: (N, 2)
-        # anthropometry: (N, anthropometry_dim)
-
-        # Step 1: Generate FiLM parameters from the anthropometry data.
-        film_params = self.film_generator(anthropometry)
-
-        # Step 2: Reshape the parameters to separate gammas and betas.
-        # The shape becomes (N, num_layers, hidden_dim, 2)
-        film_params = film_params.view(
-            anthropometry.shape[0],
-            self.num_modulated_layers,
-            self.decoder_hidden_dim,
-            2
-        )
-        gammas = film_params[..., 0]  # Shape: (N, num_layers, hidden_dim)
-        betas = film_params[..., 1]   # Shape: (N, num_layers, hidden_dim)
-
-        # Step 3: Pass coordinates and FiLM params to the main network to get the final output.
-        output = self.main_network(az_el, gammas, betas)
-        return output
-
+###### Things taken from DiGS paper#############
 
 class Decoder(nn.Module):
 
@@ -637,102 +646,6 @@ class FCBlock(MetaModule):
             output *= scaling # 1.0
 
         return output
-
-class FiLMedFCBlock(nn.Module):
-    """
-    A Fully Connected (FC) block that is modulated by FiLM parameters.
-    This network processes the primary input (e.g., coordinates).
-    """
-    def __init__(self, in_features, out_features, num_hidden_layers, hidden_features,
-                 outermost_linear=False, nonlinearity='sine', init_type='siren'):
-        super().__init__()
-
-        nl_dict = {'sine': Sine(), 'relu': nn.ReLU(inplace=True)}
-        self.nl = nl_dict.get(nonlinearity, Sine()) # Default to Sine
-
-        self.net = nn.ModuleList()
-
-        # Input layer
-        self.net.append(nn.Linear(in_features, hidden_features))
-
-        # Hidden layers
-        for _ in range(num_hidden_layers):
-            self.net.append(nn.Linear(hidden_features, hidden_features))
-
-        # Output layer
-        self.net.append(nn.Linear(hidden_features, out_features))
-
-        self.outermost_linear = outermost_linear
-
-        # Apply weight initialization
-        if init_type == 'siren':
-            self.apply(sine_init)
-            self.net[0].apply(first_layer_sine_init)
-        # Add other init types here if needed
-
-    def forward(self, x, gammas, betas):
-        """
-        Forward pass with FiLM modulation.
-        - x: The primary input tensor (e.g., coordinates).
-        - gammas: Scaling parameters from the FiLMGenerator.
-        - betas: Shifting parameters from the FiLMGenerator.
-        """
-        # Modulate the input layer and all hidden layers
-        for i, layer in enumerate(self.net[:-1]):
-            x = layer(x)
-            # Apply FiLM: y = gamma * x + beta
-            # Unsqueeze is for broadcasting across the feature dimension
-            x = gammas[:, i, :] * x + betas[:, i, :]
-            x = self.nl(x)
-
-        # Pass through the final layer
-        x = self.net[-1](x)
-        if not self.outermost_linear:
-            x = self.nl(x)
-
-        return x
-
-
-# New module to generate the FiLM parameters
-class FiLMGenerator(nn.Module):
-    """
-    Generates FiLM parameters (gamma and beta) from a conditioning input.
-    """
-    def __init__(self, cond_dim, num_modulated_layers, film_hidden_dim):
-        super().__init__()
-
-        # The generator must produce 2 values (gamma, beta) for each feature
-        # in each modulated layer of the main network.
-        output_size = num_modulated_layers * film_hidden_dim * 2
-
-        # A simple MLP to generate the parameters
-        self.generator = nn.Sequential(
-            nn.Linear(cond_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, output_size),
-        )
-
-        # Initialize the final layer to output values close to an identity
-        # transformation (gamma=1, beta=0) at the start of training.
-        with torch.no_grad():
-            self.generator[-1].weight.fill_(0.)
-            # Split the bias tensor to initialize gammas and betas separately
-            gamma_bias, beta_bias = torch.chunk(self.generator[-1].bias, 2, dim=0)
-            gamma_bias.fill_(1.)
-            beta_bias.fill_(0.)
-
-    def forward(self, cond_input):
-        return self.generator(cond_input)
-
-
 
 
 
@@ -870,3 +783,5 @@ def geom_relu_last_layers_init(m):
             num_input = m.weight.size(-1)
             m.weight.normal_(mean=np.sqrt(np.pi) / np.sqrt(num_input), std=0.00001)
             m.bias.data = torch.Tensor([-radius_init])
+
+

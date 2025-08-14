@@ -22,7 +22,7 @@ torch.set_float32_matmul_precision('high')
 import math
 from HRTFdatasets import MergedHRTFDataset
 from model import (
-        HRTFNetwork,
+        CondHRTFNetwork,
         HRTFNetwork3D
     )
 
@@ -61,11 +61,6 @@ def spherical_to_cartesian(coords_deg, radius=1.0):
 def compute_laplacian(y, x):
     """
     Computes the Laplacian of a multi-channel output y w.r.t. a 3D input x.
-
-    This version is significantly faster because it computes the forward pass
-    (y) only ONCE outside this function, and then iterates through the
-    output channels to compute derivatives.
-
     Args:
         y (torch.Tensor): The model's output tensor of shape (N, F).
                           This is the result of the forward pass.
@@ -78,11 +73,8 @@ def compute_laplacian(y, x):
     N, F = y.shape
     laplacian = torch.zeros_like(y)
 
-    # Loop over each frequency channel (F) of the output
+    # Loop over each frequency of the output
     for i in range(F):
-        # We need to create a graph from x to this specific channel y[:, i]
-        # `create_graph=True` is essential for taking the second derivative.
-        # The .sum() creates the scalar value required by torch.autograd.grad.
         first_grads = torch.autograd.grad(
             y[:, i].sum(),
             x,
@@ -90,12 +82,8 @@ def compute_laplacian(y, x):
         )[0]
 
         # Now, compute the second derivative for this channel
-        # This is the core of the Laplacian calculation
         laplacian_i = 0
         for j in range(x.shape[1]): # Loop over spatial dimensions (0, 1, 2)
-            # Differentiate the j-th component of the first gradient
-            # with respect to x. `retain_graph=True` is needed because
-            # we are differentiating `first_grads` multiple times within this loop.
             second_grads = torch.autograd.grad(
                 first_grads[:, j].sum(),
                 x,
@@ -108,27 +96,6 @@ def compute_laplacian(y, x):
 
 
     return laplacian
-
-def xde_laplacian(x, y):
-    """
-    Defines the 3D Poisson equation: ∇²y
-    The Laplacian is computed by summing the diagonal elements of the Hessian.
-    """
-
-    # d²y/dx²
-    dy_xx = dde.grad.hessian(y, x, i=0, j=0)
-    # d²y/dy²
-    dy_yy = dde.grad.hessian(y, x, i=1, j=1)
-    # d²y/dz²
-    dy_zz = dde.grad.hessian(y, x, i=2, j=2)
-
-    # Sum the diagonal elements to get the Laplacian
-    laplacian_y = dy_xx + dy_yy + dy_zz
-
-    # Return the residual of the PDE: -∇²y - 1 = 0
-    return laplacian_y
-
-
 
 
 def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, last_epoch=-1):
@@ -330,15 +297,15 @@ def train(args):
         num_training_steps = NUM_EPOCHS * len(train_loader)
         num_warmup_steps = int(0.1 * num_training_steps)
 
-        model = HRTFNetwork3D(
-            anthropometry_dim=ANTHROPOMETRY_DIM,
-            target_freq_dim=TARGET_FREQ_DIM,
-            latent_dim=args.latent_dim,
-            decoder_hidden_dim=args.hidden_dim,
-            decoder_n_hidden_layers=args.n_layers,
-            init_type=DECODER_INIT,
-            nonlinearity=DECODER_NONLINEARITY
-        ).to(DEVICE)
+        model = CondHRTFNetwork(
+                d_anthro_in=ANTHROPOMETRY_DIM,
+                d_inr_out=TARGET_FREQ_DIM,
+                d_latent=args.latent_dim,
+                d_inr_hidden=args.hidden_dim,
+                n_inr_layers=args.n_layers,
+                d_inr_in=3
+            ).to(DEVICE)
+
 
         #model = torch.compile(model)
         optimizer = optim.Adam(model.parameters(), lr=args.lr)
@@ -402,8 +369,8 @@ def train(args):
                     # 4. Forward pass and compute Laplacian
                     h_phys_log = model(phys_locs_cartesian, phys_anthro)
 
-                    h_phys = 10**((60 * (h_phys_log + 1)) / 20)
-                    laplacian_h = xde_laplacian(h_phys, phys_locs_cartesian)
+                    h_phys = 10**((50 * (h_phys_log + 1)+85) / 20) ## Inverse of all transformations done during preprocessing
+                    laplacian_h = compute_laplacian(h_phys, phys_locs_cartesian)
 
                     # 5. Calculate Helmholtz residual: laplacian(H) + k^2 * H
                     helmholtz_residual = laplacian_h + k_squared.unsqueeze(0) * h_phys
@@ -424,17 +391,21 @@ def train(args):
                 num_valid_points_epoch += num_valid_points_batch.item()
 
                 with torch.no_grad():
-                    epsilon = 1e-9
-                    pred_abs = torch.abs(predicted_hrtfs if args.scale == 'log' else predicted_hrtfs) + epsilon
-                    gt_abs = torch.abs(target_hrtfs if args.scale == 'log' else target_hrtfs) + epsilon
-                    lsd_elements_sq = torch.square(20 * torch.log10(gt_abs / pred_abs)) if args.scale != 'log' else torch.square(predicted_hrtfs - target_hrtfs)
-                    train_lsd_accum += torch.sum(lsd_elements_sq * masks).item()
-                breakpoint()
+                    if args.scale == 'log': # LSD for log scale data
+                        lsd_elements_sq = torch.square(50*predicted_hrtfs - 50*target_hrtfs)
+                    else: # LSD for linear scale data (original formula)
+                        epsilon = 1e-9
+                        pred_abs = torch.abs(predicted_hrtfs) + epsilon
+                        gt_abs = torch.abs(target_hrtfs) + epsilon
+                        lsd_elements_sq = torch.square(20 * torch.log10(gt_abs / pred_abs))
+                    masked_lsd_elements_sq = lsd_elements_sq * masks
+                    batch_lsd_sum_sq = torch.sum(masked_lsd_elements_sq)
+                train_lsd_accum += batch_lsd_sum_sq.item()
 
             # Calculate average epoch losses
             avg_train_loss = train_loss_accum / num_valid_points_epoch if num_valid_points_epoch > 0 else 0
             avg_train_phys_loss = train_phys_loss_accum / (len(train_loader) * B * N_loc) if args.lambda_helmholtz > 0 else 0
-            avg_train_lsd = np.sqrt(train_lsd_accum / (num_valid_points_epoch * NUM_FREQ_BINS)) if num_valid_points_epoch > 0 else 0
+            avg_train_lsd = np.sqrt(train_lsd_accum / (num_valid_points_epoch*NUM_FREQ_BINS))
 
             # --- Validation Loop ---
             model.eval()
@@ -460,7 +431,7 @@ def train(args):
                         val_loss_accum += torch.sum(error_squared * masks).item()
                         val_valid_points_epoch += num_valid_points_batch.item()
                         # LSD calculation
-                        lsd_elements_sq = torch.square(60*(predicted_hrtfs+1) - 60*(target_hrtfs+1)) if args.scale == 'log' else torch.square(20 * torch.log10((torch.abs(target_hrtfs) + 1e-9) / (torch.abs(predicted_hrtfs) + 1e-9)))
+                        lsd_elements_sq = torch.square(50*(predicted_hrtfs+1) - 50*(target_hrtfs+1)) if args.scale == 'log' else torch.square(20 * torch.log10((torch.abs(target_hrtfs) + 1e-9) / (torch.abs(predicted_hrtfs) + 1e-9)))
                         val_lsd_accum += torch.sum(lsd_elements_sq * masks).item()
 
             avg_val_loss = val_loss_accum / val_valid_points_epoch if val_valid_points_epoch > 0 else 0

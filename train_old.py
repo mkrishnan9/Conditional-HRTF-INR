@@ -1,3 +1,6 @@
+##### Original train.py file from HRTFField. #########
+
+
 from HRTFdatasets import MergedHRTFDataset, PartialHRTFDataset
 import os
 import numpy as np

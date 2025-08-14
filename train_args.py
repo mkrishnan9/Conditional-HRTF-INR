@@ -1,3 +1,6 @@
+####Code to train without including Chedar in the valuation set.
+
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -14,89 +17,47 @@ import collections
 from HRTFdatasets import MergedHRTFDataset
 from model import (
         HRTFNetwork,
-        AnthropometryEncoder,
-        CrossAttentionEncoder,
-        FCBlock,
-        MetaModule,
-        BatchLinear,
-        Sine,
-        MetaSequential,
     )
 
 import logging
 
 import argparse
 
-
-
-
-
-def custom_collate_fn(batch):
+def merged_collate_fn(batch):
     """
-    Collates samples into batches with padding and masks.
-    Input: list of tuples (location_tensor, hrtf_tensor, anthro_tensor)
-    Output: tuple (padded_locs, padded_hrtfs, masks, collated_anthros)
+    collate function for MergedHRTFDataset using pad_sequence.
+    Input: list of tuples (location_tensor, hrtf_tensor, anthro_tensor, name)
+    Output: tuple (padded_locs, padded_hrtfs, masks, collated_anthros, names)
     """
-    # Filter out potential None items from dataset failures
     valid_batch = [item for item in batch if item is not None and all(i is not None for i in item)]
-
-
-    locations, hrtfs, anthros = zip(*valid_batch)
-
-    B = len(locations)
-    anthro_dim = anthros[0].shape[0]
-    num_freq_bins = hrtfs[0].shape[1]
-
-
-    lengths = [loc.shape[0] for loc in locations]
-    max_num_loc = max(lengths) if lengths else 0
-
-    if max_num_loc == 0:
-        print("Warning: Batch contains samples with 0 locations after filtering.")
+    if not valid_batch:
         return None
 
 
-    padded_locs = torch.zeros((B, max_num_loc, 2), dtype=torch.float32)
-    padded_hrtfs = torch.zeros((B, max_num_loc, num_freq_bins), dtype=torch.float32)
-    masks = torch.zeros((B, max_num_loc, 1), dtype=torch.float32) # Mask shape (B, N_loc, 1) for broadcasting
-
-    collated_anthros = torch.stack(anthros, dim=0) # Shape: (B, anthro_dim)
-
-    for i in range(B):
-        n_loc = lengths[i]
-        if n_loc > 0:
-            padded_locs[i, :n_loc, :] = locations[i]
-            padded_hrtfs[i, :n_loc, :] = hrtfs[i]
-            masks[i, :n_loc, :] = 1.0 # Set mask to 1 for valid locations
-
-    return padded_locs, padded_hrtfs, masks, collated_anthros
-
-def merged_collate_fn(batch):
-    """
-    Collates samples from the MergedHRTFDataset into batches with padding and masks.
-    """
-    valid_batch = [item for item in batch if item is not None and all(i is not None for i in item)]
-    if not valid_batch: return None
-
     locations, hrtfs, anthros, names = zip(*valid_batch)
-    B = len(locations)
-    anthro_dim = anthros[0].shape[0]
-    num_freq_bins = hrtfs[0].shape[1]
-    lengths = [loc.shape[0] for loc in locations]
-    max_num_loc = max(lengths) if lengths else 0
-    if max_num_loc == 0: return None
 
-    padded_locs = torch.zeros((B, max_num_loc, 2), dtype=torch.float32)
-    padded_hrtfs = torch.zeros((B, max_num_loc, num_freq_bins), dtype=torch.float32)
-    masks = torch.zeros((B, max_num_loc, 1), dtype=torch.float32)
+    # Pad sequences
+    # pad_sequence expects a list of tensors with shape (L, *)
+    # locations: list of (N_loc_i, 2)
+    # hrtfs: list of (N_loc_i, num_freq_bins)
+
+    # Need to handle empty locations within subjects - MergedHRTFDataset should ideally not yield these
+    # If a subject has 0 locations, it will be filtered out by `valid_batch`.
+    # Assuming valid_batch always has items with N_loc > 0 for their tensors.
+
+
+    # Pad locations and HRTFs
+    padded_locs = torch.nn.utils.rnn.pad_sequence(locations, batch_first=True, padding_value=0.0)
+    padded_hrtfs = torch.nn.utils.rnn.pad_sequence(hrtfs, batch_first=True, padding_value=0.0)
+
+    # Create masks: 1 where data is present, 0 where padded
+    max_num_loc = padded_locs.shape[1]
+    masks = torch.zeros((len(locations), max_num_loc, 1), dtype=torch.float32)
+    for i, loc_tensor in enumerate(locations):
+        masks[i, :loc_tensor.shape[0], :] = 1.0
+
+    # Stack anthropometries - they should all be the same shape (anthro_dim,)
     collated_anthros = torch.stack(anthros, dim=0)
-
-    for i in range(B):
-        n_loc = lengths[i]
-        if n_loc > 0:
-            padded_locs[i, :n_loc, :] = locations[i]
-            padded_hrtfs[i, :n_loc, :] = hrtfs[i]
-            masks[i, :n_loc, :] = 1.0
 
     return padded_locs, padded_hrtfs, masks, collated_anthros, list(names)
 
@@ -114,10 +75,8 @@ def metrics(gt, pred, scale="linear"):
 def calculate_anthro_stats(dataset_subset):
     """
     Calculates mean and std dev for anthropometry across the dataset subset.
-    Assumes dataset items are valid (location_tensor, hrtf_tensor, anthro_tensor).
     """
-    if not isinstance(dataset_subset, Subset):
-        raise TypeError("calculate_anthro_stats expects a PyTorch Subset object.")
+
 
     print("Calculating anthropometry statistics on training set...")
     all_anthro_tensors = []
@@ -125,20 +84,13 @@ def calculate_anthro_stats(dataset_subset):
     # Iterate through the indices specified by the Subset
     for i in range(len(dataset_subset)):
         try:
-            # Get the item from the original dataset using the subset's index mapping
-            # Assumes __getitem__ returns (loc_tensor, hrtf_tensor, anthro_tensor)
-            # or raises an error if loading fails.
             _, _, anthro_tensor, _ = dataset_subset.dataset[dataset_subset.indices[i]]
-
-
             all_anthro_tensors.append(anthro_tensor)
         except Exception as e:
             # Catch potential errors during dataset access for a specific index
             print(f"Warning: Could not retrieve or unpack item for original dataset index {dataset_subset.indices[i]}: {e}. Skipping this item.")
             continue # Skip this problematic index
 
-    if not all_anthro_tensors:
-        raise ValueError("No valid anthropometric data was collected from the training set to calculate stats.")
 
     # Stack collected tensors
     try:
@@ -163,82 +115,7 @@ def calculate_anthro_stats(dataset_subset):
 
 def normalize_anthro(anthro_tensor, mean, std):
     """Applies Z-score normalization."""
-    # Ensure mean and std are broadcastable to anthro_tensor shape if needed
-    # Assuming mean/std are 1D tensors of size (anthro_dim,)
-    # and anthro_tensor is (batch_size * n_loc, anthro_dim)
     return (anthro_tensor - mean.to(anthro_tensor.device)) / std.to(anthro_tensor.device)
-
-def custom_collate_fn_init(batch):
-    """Collates samples with variable number of locations into batch tensors."""
-    locations = []
-    hrtfs = []
-    anthros = []
-    # Filter out potential None items from dataset failures before zipping
-    valid_batch = [item for item in batch if item is not None and all(i is not None for i in item)]
-
-    if not valid_batch:
-        print("Warning: custom_collate_fn received an empty or all-None batch. Skipping.")
-        return None
-
-    try:
-        locations, hrtfs, anthros = zip(*valid_batch)
-    except Exception as e:
-        print(f"Error during unzipping batch in collate_fn: {e}. Batch content: {valid_batch}")
-        return None # Skip batch
-
-    all_locs_flat = []
-    all_hrtfs_flat = []
-    all_anthros_repeated = []
-
-    for i in range(len(locations)):
-        loc_i, hrtf_i, anthro_i = locations[i], hrtfs[i], anthros[i]
-
-        # Basic validation
-        if not isinstance(loc_i, torch.Tensor) or not isinstance(hrtf_i, torch.Tensor) or not isinstance(anthro_i, torch.Tensor):
-            print(f"Warning: Invalid data type in batch item {i}. Skipping subject.")
-            continue
-
-        n_loc = loc_i.shape[0]
-        if n_loc == 0:
-            # print(f"Warning: Subject {i} in batch has 0 locations. Skipping.") # Can be verbose
-            continue
-
-        # Check if shapes are reasonable (basic check)
-        if loc_i.ndim != 2 or hrtf_i.ndim != 2 or anthro_i.ndim != 1:
-             print(f"Warning: Unexpected tensor dimensions for subject {i} in batch. Skipping. Shapes: loc {loc_i.shape}, hrtf {hrtf_i.shape}, anthro {anthro_i.shape}")
-             continue
-        if loc_i.shape[0] != hrtf_i.shape[0]:
-             print(f"Warning: Mismatch between locations ({loc_i.shape[0]}) and HRTFs ({hrtf_i.shape[0]}) for subject {i}. Skipping.")
-             continue
-
-
-        # Repeat anthropometry for each location
-        try:
-            anthro_i_repeated = anthro_i.unsqueeze(0).expand(n_loc, -1) # Repeat anthro
-        except Exception as e:
-             print(f"Error expanding anthropometry for subject {i}: {e}. Anthro shape: {anthro_i.shape}, n_loc: {n_loc}. Skipping.")
-             continue
-
-
-        all_locs_flat.append(loc_i)
-        all_hrtfs_flat.append(hrtf_i)
-        all_anthros_repeated.append(anthro_i_repeated)
-
-    if not all_locs_flat:
-        # print("Warning: Batch resulted in no valid data after processing subjects. Skipping batch.") # Can be verbose
-        return None # Skip if batch becomes empty
-
-    # Concatenate all points in the batch
-    try:
-        batch_locs = torch.cat(all_locs_flat, dim=0)
-        batch_hrtfs = torch.cat(all_hrtfs_flat, dim=0)
-        batch_anthros = torch.cat(all_anthros_repeated, dim=0)
-    except Exception as e:
-        print(f"Error concatenating batch tensors: {e}. Skipping batch.")
-        return None
-
-
-    return batch_locs, batch_hrtfs, batch_anthros
 
 # --- Main Training Function ---
 

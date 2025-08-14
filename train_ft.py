@@ -1,3 +1,9 @@
+#########Code to pretrain on CHEDAR data and finetune on measured data like HUTUBS and CIPIC.
+####### Does not have a cross-validation strategy implemented yet.
+#### It also has other issues, like if I am pretraining on CHEDAR then maybe I need to monitor what the validation is on other datasets
+### Overall comments: Needs more careful implementation
+
+
 import argparse
 import os
 import torch
@@ -18,7 +24,8 @@ torch.set_float32_matmul_precision('high')
 import collections
 from HRTFdatasets import MergedHRTFDataset
 from model import (
-        HRTFNetwork
+        HRTFNetwork,
+        HRTFNetwork_conv
     )
 
 import logging
@@ -52,25 +59,21 @@ def plot_midsagittal_plane(locations, hrtfs, title, ax):
     midsagittal_coords = locations[midsagittal_indices]
     midsagittal_hrtfs = hrtfs[midsagittal_indices]
 
-    # --- UPDATED SORTING LOGIC ---
-    # Convert to numpy to apply your sorting key
+
     coords_np = midsagittal_coords.cpu().numpy()
     azimuths = coords_np[:, 0]
     elevations = coords_np[:, 1]
 
-    # Apply your sophisticated sorting key
+
     sort_key = elevations - (azimuths / 90 * elevations) + azimuths
     sorted_indices = np.argsort(sort_key)
-    # --- END UPDATED LOGIC ---
-
-    # Use the new sorted order to arrange the HRTFs and y-axis labels
     sorted_hrtfs = midsagittal_hrtfs[sorted_indices].cpu().numpy()
 
-    # We now need a custom y-axis label for the path
+
     # For simplicity, we'll just use a continuous index for the y-axis ticks.
     # A more advanced version could label the elevations along the path.
 
-    # Create the plot
+
     img = ax.imshow(sorted_hrtfs.T, aspect='auto', origin='lower',
                     extent=[0, len(sorted_indices), 0, 16000]) # Assuming max freq is 16kHz
 
@@ -82,74 +85,6 @@ def plot_midsagittal_plane(locations, hrtfs, title, ax):
 
 
 
-def custom_collate_fn(batch):
-    """
-    Collates samples into batches with padding and masks.
-    Input: list of tuples (location_tensor, hrtf_tensor, anthro_tensor)
-    Output: tuple (padded_locs, padded_hrtfs, masks, collated_anthros)
-    """
-    # Filter out potential None items from dataset failures
-    valid_batch = [item for item in batch if item is not None and all(i is not None for i in item)]
-
-
-    locations, hrtfs, anthros = zip(*valid_batch)
-
-    B = len(locations)
-    anthro_dim = anthros[0].shape[0]
-    num_freq_bins = hrtfs[0].shape[1]
-
-
-    lengths = [loc.shape[0] for loc in locations]
-    max_num_loc = max(lengths) if lengths else 0
-
-    if max_num_loc == 0:
-        print("Warning: Batch contains samples with 0 locations after filtering.")
-        return None
-
-
-    padded_locs = torch.zeros((B, max_num_loc, 2), dtype=torch.float32)
-    padded_hrtfs = torch.zeros((B, max_num_loc, num_freq_bins), dtype=torch.float32)
-    masks = torch.zeros((B, max_num_loc, 1), dtype=torch.float32) # Mask shape (B, N_loc, 1) for broadcasting
-
-    collated_anthros = torch.stack(anthros, dim=0) # Shape: (B, anthro_dim)
-
-    for i in range(B):
-        n_loc = lengths[i]
-        if n_loc > 0:
-            padded_locs[i, :n_loc, :] = locations[i]
-            padded_hrtfs[i, :n_loc, :] = hrtfs[i]
-            masks[i, :n_loc, :] = 1.0 # Set mask to 1 for valid locations
-
-    return padded_locs, padded_hrtfs, masks, collated_anthros
-
-# def merged_collate_fn(batch):
-#     """
-#     Collates samples from the MergedHRTFDataset into batches with padding and masks.
-#     """
-#     valid_batch = [item for item in batch if item is not None and all(i is not None for i in item)]
-#     if not valid_batch: return None
-
-#     locations, hrtfs, anthros, names = zip(*valid_batch)
-#     B = len(locations)
-#     anthro_dim = anthros[0].shape[0]
-#     num_freq_bins = hrtfs[0].shape[1]
-#     lengths = [loc.shape[0] for loc in locations]
-#     max_num_loc = max(lengths) if lengths else 0
-#     if max_num_loc == 0: return None
-
-#     padded_locs = torch.zeros((B, max_num_loc, 2), dtype=torch.float32)
-#     padded_hrtfs = torch.zeros((B, max_num_loc, num_freq_bins), dtype=torch.float32)
-#     masks = torch.zeros((B, max_num_loc, 1), dtype=torch.float32)
-#     collated_anthros = torch.stack(anthros, dim=0)
-
-#     for i in range(B):
-#         n_loc = lengths[i]
-#         if n_loc > 0:
-#             padded_locs[i, :n_loc, :] = locations[i]
-#             padded_hrtfs[i, :n_loc, :] = hrtfs[i]
-#             masks[i, :n_loc, :] = 1.0
-
-#     return padded_locs, padded_hrtfs, masks, collated_anthros, list(names)
 
 def merged_collate_fn(batch):
     """
@@ -161,7 +96,7 @@ def merged_collate_fn(batch):
     if not valid_batch:
         return None
 
-    # Unzip the batch items
+
     locations, hrtfs, anthros, names = zip(*valid_batch)
 
     # Pad sequences
@@ -173,16 +108,12 @@ def merged_collate_fn(batch):
     # If a subject has 0 locations, it will be filtered out by `valid_batch`.
     # Assuming valid_batch always has items with N_loc > 0 for their tensors.
 
-    # Check if any sequence is empty after filtering
-    if not locations:
-        return None
 
     # Pad locations and HRTFs
     padded_locs = torch.nn.utils.rnn.pad_sequence(locations, batch_first=True, padding_value=0.0)
     padded_hrtfs = torch.nn.utils.rnn.pad_sequence(hrtfs, batch_first=True, padding_value=0.0)
 
     # Create masks: 1 where data is present, 0 where padded
-    # The mask should reflect the original lengths
     max_num_loc = padded_locs.shape[1]
     masks = torch.zeros((len(locations), max_num_loc, 1), dtype=torch.float32)
     for i, loc_tensor in enumerate(locations):
@@ -207,10 +138,8 @@ def metrics(gt, pred, scale="linear"):
 def calculate_anthro_stats(dataset_subset):
     """
     Calculates mean and std dev for anthropometry across the dataset subset.
-    Assumes dataset items are valid (location_tensor, hrtf_tensor, anthro_tensor).
     """
-    if not isinstance(dataset_subset, Subset):
-        raise TypeError("calculate_anthro_stats expects a PyTorch Subset object.")
+
 
     print("Calculating anthropometry statistics on training set...")
     all_anthro_tensors = []
@@ -218,20 +147,13 @@ def calculate_anthro_stats(dataset_subset):
     # Iterate through the indices specified by the Subset
     for i in range(len(dataset_subset)):
         try:
-            # Get the item from the original dataset using the subset's index mapping
-            # Assumes __getitem__ returns (loc_tensor, hrtf_tensor, anthro_tensor)
-            # or raises an error if loading fails.
             _, _, anthro_tensor, _ = dataset_subset.dataset[dataset_subset.indices[i]]
-
-
             all_anthro_tensors.append(anthro_tensor)
         except Exception as e:
             # Catch potential errors during dataset access for a specific index
             print(f"Warning: Could not retrieve or unpack item for original dataset index {dataset_subset.indices[i]}: {e}. Skipping this item.")
             continue # Skip this problematic index
 
-    if not all_anthro_tensors:
-        raise ValueError("No valid anthropometric data was collected from the training set to calculate stats.")
 
     # Stack collected tensors
     try:
@@ -256,82 +178,8 @@ def calculate_anthro_stats(dataset_subset):
 
 def normalize_anthro(anthro_tensor, mean, std):
     """Applies Z-score normalization."""
-    # Ensure mean and std are broadcastable to anthro_tensor shape if needed
-    # Assuming mean/std are 1D tensors of size (anthro_dim,)
-    # and anthro_tensor is (batch_size * n_loc, anthro_dim)
     return (anthro_tensor - mean.to(anthro_tensor.device)) / std.to(anthro_tensor.device)
 
-def custom_collate_fn_init(batch):
-    """Collates samples with variable number of locations into batch tensors."""
-    locations = []
-    hrtfs = []
-    anthros = []
-    # Filter out potential None items from dataset failures before zipping
-    valid_batch = [item for item in batch if item is not None and all(i is not None for i in item)]
-
-    if not valid_batch:
-        print("Warning: custom_collate_fn received an empty or all-None batch. Skipping.")
-        return None
-
-    try:
-        locations, hrtfs, anthros = zip(*valid_batch)
-    except Exception as e:
-        print(f"Error during unzipping batch in collate_fn: {e}. Batch content: {valid_batch}")
-        return None # Skip batch
-
-    all_locs_flat = []
-    all_hrtfs_flat = []
-    all_anthros_repeated = []
-
-    for i in range(len(locations)):
-        loc_i, hrtf_i, anthro_i = locations[i], hrtfs[i], anthros[i]
-
-        # Basic validation
-        if not isinstance(loc_i, torch.Tensor) or not isinstance(hrtf_i, torch.Tensor) or not isinstance(anthro_i, torch.Tensor):
-            print(f"Warning: Invalid data type in batch item {i}. Skipping subject.")
-            continue
-
-        n_loc = loc_i.shape[0]
-        if n_loc == 0:
-            # print(f"Warning: Subject {i} in batch has 0 locations. Skipping.") # Can be verbose
-            continue
-
-        # Check if shapes are reasonable (basic check)
-        if loc_i.ndim != 2 or hrtf_i.ndim != 2 or anthro_i.ndim != 1:
-             print(f"Warning: Unexpected tensor dimensions for subject {i} in batch. Skipping. Shapes: loc {loc_i.shape}, hrtf {hrtf_i.shape}, anthro {anthro_i.shape}")
-             continue
-        if loc_i.shape[0] != hrtf_i.shape[0]:
-             print(f"Warning: Mismatch between locations ({loc_i.shape[0]}) and HRTFs ({hrtf_i.shape[0]}) for subject {i}. Skipping.")
-             continue
-
-
-        # Repeat anthropometry for each location
-        try:
-            anthro_i_repeated = anthro_i.unsqueeze(0).expand(n_loc, -1) # Repeat anthro
-        except Exception as e:
-             print(f"Error expanding anthropometry for subject {i}: {e}. Anthro shape: {anthro_i.shape}, n_loc: {n_loc}. Skipping.")
-             continue
-
-
-        all_locs_flat.append(loc_i)
-        all_hrtfs_flat.append(hrtf_i)
-        all_anthros_repeated.append(anthro_i_repeated)
-
-    if not all_locs_flat:
-        # print("Warning: Batch resulted in no valid data after processing subjects. Skipping batch.") # Can be verbose
-        return None # Skip if batch becomes empty
-
-    # Concatenate all points in the batch
-    try:
-        batch_locs = torch.cat(all_locs_flat, dim=0)
-        batch_hrtfs = torch.cat(all_hrtfs_flat, dim=0)
-        batch_anthros = torch.cat(all_anthros_repeated, dim=0)
-    except Exception as e:
-        print(f"Error concatenating batch tensors: {e}. Skipping batch.")
-        return None
-
-
-    return batch_locs, batch_hrtfs, batch_anthros
 
 # --- Main Training Function ---
 
@@ -340,15 +188,10 @@ def train(args):
     DEVICE = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
 
 
-    # Create a unique save directory for this specific run
-    #run_name = f"lr{args.lr}_bs{args.batch_size}_ld{args.latent_dim}_hd{args.hidden_dim}_nl{args.n_layers}_epochs{args.epochs}"
-    #SAVE_DIR = os.path.join(args.save_dir, run_name)
+
     SAVE_DIR = os.path.join(args.save_dir)
     os.makedirs(SAVE_DIR, exist_ok=True)
 
-
-
-    # Setup logging to save to a file in the run's main directory
 
     print(f"Using device: {DEVICE}")
     print(f"Checkpoints and logs will be saved to: {SAVE_DIR}")
@@ -365,7 +208,7 @@ def train(args):
     # Model & Training Parameters
     NUM_FREQ_BINS = 92             # Number of frequency bins (1 to 92 inclusive)
     TARGET_FREQ_DIM = NUM_FREQ_BINS # Model output dimension
-    DECODER_INIT = 'siren'         # Initialization type for decoder (ensure model.py handles this)
+    DECODER_INIT = 'siren'         # Initialization type for decoder
     DECODER_NONLINEARITY = 'sine'  # Activation function for decoder
 
 
@@ -414,7 +257,7 @@ def train(args):
         scale=args.scale
     )
 
-    # --- Subject-Aware Splitting Logic ---
+    # --- Subject-Aware Splitting Logic so that ears of one subject doesnt get mixed up in training and validation ---
     subjects = {}
     print("Mapping subjects to registry indices for splitting...")
     for i, file_path in enumerate(merged_dataset.file_registry):
@@ -468,7 +311,7 @@ def train(args):
     print("Initializing model...")
 
 
-    model = HRTFNetwork(
+    model = HRTFNetwork_conv(
             anthropometry_dim=ANTHROPOMETRY_DIM,
             target_freq_dim=TARGET_FREQ_DIM,
             latent_dim=args.latent_dim,
@@ -558,8 +401,8 @@ def train(args):
 
             # --- Calculate LSD metric using masks ---
             with torch.no_grad():
-                if args.scale == 'log': # LSD for log scale data
-                    lsd_elements_sq = torch.square(predicted_hrtfs - target_hrtfs) # error_squared is already this
+                if args.scale == 'log': # LSD for log scale data with the (-1,1) normalization corrected
+                    lsd_elements_sq = torch.square(50*(predicted_hrtfs+1) - 50*(target_hrtfs+1)) # error_squared is already this
                 else: # LSD for linear scale data (original formula)
                     epsilon = 1e-9
                     pred_abs = torch.abs(predicted_hrtfs) + epsilon
@@ -597,6 +440,8 @@ def train(args):
         val_loss_accum = 0.0
         val_lsd_accum = 0.0
         val_valid_points_epoch = 0
+        avg_val_loss =0
+        avg_val_lsd =0
         with torch.no_grad():
             for batch in val_loader:
                 if batch is None: continue
@@ -604,7 +449,7 @@ def train(args):
                 locations, target_hrtfs, masks, anthropometry, _ = batch
                 locations = locations.to(DEVICE, non_blocking=True)
                 target_hrtfs = target_hrtfs.to(DEVICE, non_blocking=True)
-                breakpoint()
+
                 masks = masks.to(DEVICE, non_blocking=True)
                 anthropometry = anthropometry.to(DEVICE, non_blocking=True)
 
@@ -644,9 +489,9 @@ def train(args):
 
                         val_valid_points_epoch += num_valid_points_batch.item()
         # Calculate average epoch validation loss and LSD
-
-        avg_val_loss = val_loss_accum / val_valid_points_epoch
-        avg_val_lsd = np.sqrt(val_lsd_accum / (val_valid_points_epoch * NUM_FREQ_BINS))
+        if val_valid_points_epoch > 0:
+            avg_val_loss = val_loss_accum / val_valid_points_epoch
+            avg_val_lsd = np.sqrt(val_lsd_accum / (val_valid_points_epoch * NUM_FREQ_BINS))
 
 
 
@@ -657,10 +502,19 @@ def train(args):
         # elapsed_time = epoch_end_time - epoch_start_time
         # print(f"Epoch {epoch+1} took {elapsed_time:.2f} seconds.")
 
+        # model_save_path = os.path.join(SAVE_DIR, f'hrtf_chedar_pretrained.pth')
 
+        # torch.save({
+        #         'epoch': epoch + 1,
+        #         'model_state_dict': model.state_dict(),
+        #         'optimizer_state_dict': optimizer.state_dict(),
+        #         'loss': best_val_loss,
+        #         'anthro_mean': anthro_mean.cpu(),
+        #         'anthro_std': anthro_std.cpu(),
+        #         }, model_save_path)
 
         print(f'Epoch [{epoch+1:03d}/{args.epochs}], Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}, Train LSD: {avg_train_lsd:.4f}, Val LSD: {avg_val_lsd:.4f}')
-
+        # print(f'---> Pretrained model saved to {model_save_path}')
 
 
         # --- Save Best Model ---
@@ -668,7 +522,7 @@ def train(args):
 
             best_val_loss = avg_val_loss
             best_val_lsd = avg_val_lsd
-            model_save_path = os.path.join(SAVE_DIR, f'hrtf_anthro_model_best_allfreqs.pth')
+            model_save_path = os.path.join(SAVE_DIR, f'hrtf_anthro_pretrained_model.pth')
 
             torch.save({
                     'epoch': epoch + 1,
@@ -709,9 +563,13 @@ def train(args):
         print(f"Best Validation LSD achieved: {best_val_lsd:.6f}")
         print(f"Check '{SAVE_DIR}' for the best model checkpoint.")
     else:
-        print(f"Best Training Loss achieved: {avg_train_loss:.6f}")
-        print(f"Best Training LSD achieved: {avg_train_lsd:.6f}")
+        print(f"Training Loss achieved: {avg_train_loss:.6f}")
+        print(f" Training LSD achieved: {avg_train_lsd:.6f}")
         print(f"Check '{SAVE_DIR}' for the best model checkpoint.")
+        if val_valid_points_epoch > 0:
+            print(f"Best Validation Loss achieved: {best_val_loss:.6f}")
+            print(f"Best Validation LSD achieved: {best_val_lsd:.6f}")
+            print(f"Check '{SAVE_DIR}' for the best model checkpoint.")
 
 if __name__ == "__main__":
 
@@ -735,12 +593,12 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, default=1000, help='Number of training epochs')
 
     # Model Hyperparameters
-    parser.add_argument('--latent_dim', type=int, default=64, help='Latent dimension size')
-    parser.add_argument('--hidden_dim', type=int, default=256, help='Decoder hidden dimension size')
-    parser.add_argument('--n_layers', type=int, default=4, help='Number of layers')
+    parser.add_argument('--latent_dim', type=int, default=32, help='Latent dimension size')
+    parser.add_argument('--hidden_dim', type=int, default=128, help='Decoder hidden dimension size')
+    parser.add_argument('--n_layers', type=int, default=5, help='Number of layers')
     parser.add_argument('--scale', type=str, default="log", help='Scale')
     parser.add_argument('--eta_min', type=float, default=1e-7, help='Learning rate annealing')
-    parser.add_argument('--val_split', type=float, default=0.1, help='Training testing split')
+    parser.add_argument('--val_split', type=float, default=0.15, help='Training testing split')
 
     parser.add_argument('--augment', type=bool, default=True, help='Augmentation on/off')
     parser.add_argument('--aug_prob', type=float, default=0.5, help='Probability of augmentation')

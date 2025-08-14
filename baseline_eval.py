@@ -10,7 +10,6 @@ from tqdm import tqdm
 
 from HRTFdatasets import MergedHRTFDataset
 
-# --- Helper Functions (Adapted from your original code) ---
 
 def calculate_anthro_stats(dataset_subset):
     """
@@ -47,20 +46,16 @@ def calculate_lsd(pred_hrtf, true_hrtf):
     Calculates the Log-Spectral Distance (LSD) in dB.
     Assumes inputs are on a log-magnitude scale.
     """
-    # Ensure tensors are float for calculations
+
     pred_hrtf = pred_hrtf.float()
     true_hrtf = true_hrtf.float()
-
-    # The error is simply the squared difference on the log scale
-    error_sq = (pred_hrtf - true_hrtf)**2
-
-    # The mean is taken over the frequency dimension
+    error_sq = (50*pred_hrtf - 50*true_hrtf)**2
     lsd_per_point = torch.sqrt(torch.mean(error_sq, dim=-1))
-
-    # Return the average LSD over all spatial points in this sample
     return torch.mean(lsd_per_point)
 
-# --- Core Baseline Logic ---
+# --- Baseline evaluation: (1) Find closest-match anthropometry
+# (2) Interpolate between given spatial coordinates for that anthropometry for HRTF value at query location
+#  ---
 
 def evaluate_baseline(train_subset, val_subset, anthro_mean, anthro_std, device):
     """
@@ -116,7 +111,7 @@ def evaluate_baseline(train_subset, val_subset, anthro_mean, anthro_std, device)
     for i in tqdm(range(len(val_subset)), desc="Evaluating validation set"):
         idx = val_subset.indices[i]
 
-        # Get subject key to process each validation subject only once
+        # Get subject key to process each validation subject
         file_path = val_subset.dataset.file_registry[idx]
         base_name = os.path.basename(file_path)
         match = re.match(r"([a-zA-Z0-9]+)_(\d+).pkl", base_name)
@@ -134,7 +129,7 @@ def evaluate_baseline(train_subset, val_subset, anthro_mean, anthro_std, device)
 
         val_anthro_norm = normalize_anthro(val_anthro, anthro_mean.cpu(), anthro_std.cpu()).to(device)
 
-        # 2a. Find the closest neighbor in the training cache
+        # Find the closest neighbor in the training cache
         min_dist = float('inf')
         closest_neighbor_data = None
         for train_subject in train_data_cache:
@@ -154,8 +149,6 @@ def evaluate_baseline(train_subset, val_subset, anthro_mean, anthro_std, device)
         )
 
 
-
-
         predicted_hrtfs = torch.from_numpy(predicted_hrtfs_np)
 
         # 2c. Calculate and accumulate the error
@@ -170,11 +163,11 @@ def evaluate_baseline(train_subset, val_subset, anthro_mean, anthro_std, device)
 
 
 def main(args):
-    # --- Configuration ---
+
     DEVICE = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {DEVICE}")
 
-    # --- Dataset and Splitting (identical to your original code) ---
+
     print("Loading dataset...")
     all_available_datasets = ["hutubs", "cipic", "ari", "scut", "chedar"]
     datasets_to_load = all_available_datasets if args.include_datasets.lower() == "all" else [name.strip() for name in args.include_datasets.split(',')]
@@ -182,7 +175,7 @@ def main(args):
     merged_dataset = MergedHRTFDataset(
         dataset_names=datasets_to_load,
         preprocessed_dir=args.data_path,
-        scale="log" # Using log scale as in your training script
+        scale="log"
     )
 
     subjects = {}
@@ -198,13 +191,13 @@ def main(args):
         if subject_key not in subjects: subjects[subject_key] = []
         subjects[subject_key].append(i)
 
-    SEED = 42
-    torch.manual_seed(SEED)
-    np.random.seed(SEED)
-    random.seed(SEED)
-    torch.cuda.manual_seed_all(SEED)
+    # SEED = 0
+    # torch.manual_seed(SEED)
+    # np.random.seed(SEED)
+    # random.seed(SEED)
+    # torch.cuda.manual_seed_all(SEED)
 
-
+    ## Not using Chedar in valuation set because it is numerically simulated data that would be easy to perform well on
     chedar_subjects = []
     other_subjects = []
     for subject_key in subjects.keys():
@@ -225,8 +218,6 @@ def main(args):
     train_other_subject_keys = other_subjects[num_val_subjects:]
     train_subject_keys = train_other_subject_keys + chedar_subjects
 
-
-    # The rest of the code remains the same
     train_indices = [idx for key in train_subject_keys for idx in subjects[key]]
     val_indices = [idx for key in val_subject_keys for idx in subjects[key]]
 
@@ -262,7 +253,7 @@ if __name__ == "__main__":
     parser.add_argument('--data_path', type=str, default="/export/mkrishn9/hrtf_field/preprocessed_hrirs_common", help='Path to preprocessed data')
     parser.add_argument('--gpu', type=int, default=5, help='GPU device ID to use')
     parser.add_argument('--include_datasets', type=str, default="all", help="Comma-separated list of datasets to use. 'all' uses everything.")
-    parser.add_argument('--val_split', type=float, default=0.15, help='Fraction of subjects to use for validation')
+    parser.add_argument('--val_split', type=float, default=0.2, help='Fraction of subjects to use for validation')
 
     args = parser.parse_args()
     main(args)
