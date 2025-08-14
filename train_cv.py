@@ -592,7 +592,7 @@ if __name__ == "__main__":
 
 
     # Training Hyperparameters
-    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--lr', type=float, default=5e-3, help='Learning rate')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size per GPU')
     parser.add_argument('--epochs', type=int, default=1000, help='Number of training epochs')
 
