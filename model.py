@@ -159,7 +159,7 @@ class CondHRTFNetwork_with_Dropout(nn.Module):
                  n_inr_layers: int = 4,
                  d_inr_out: int = 92,
                  n_freqs: int = 10,
-                 dropout_rate: float = 0.5): # <-- New parameter for dropout
+                 dropout_rate: float = 0.2):
         super().__init__()
 
         self.d_inr_in = 2 # Azimuth and Elevation

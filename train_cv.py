@@ -14,6 +14,7 @@ from sklearn.model_selection import GroupKFold
 import re
 import time
 torch.set_float32_matmul_precision('high')
+import matplotlib.pyplot as plt
 
 
 import math
@@ -27,6 +28,49 @@ from model import (
     )
 
 import logging
+
+
+def plot_lsd_vs_frequency(total_lsd_sq_per_freq, total_valid_points_per_freq, num_freq, save_path=None):
+
+    if isinstance(total_lsd_sq_per_freq, torch.Tensor):
+        total_lsd_sq_per_freq = total_lsd_sq_per_freq.cpu().numpy()
+    if isinstance(total_valid_points_per_freq, torch.Tensor):
+        total_valid_points_per_freq = total_valid_points_per_freq.cpu().numpy()
+
+
+
+    mean_lsd_sq_per_freq = total_lsd_sq_per_freq / total_valid_points_per_freq
+
+    avg_lsd_per_freq = np.sqrt(mean_lsd_sq_per_freq)
+
+
+    fs = 44100
+    N_fft = 256   # Number of points in the FFT.
+
+
+    freq_bins = np.arange(1, num_freq + 1)
+    frequencies_hz = freq_bins * fs / N_fft
+
+
+    plt.style.use('seaborn-v0_8-whitegrid')
+    fig, ax = plt.subplots(figsize=(12, 7))
+
+    ax.plot(frequencies_hz, avg_lsd_per_freq, label='Average LSD', color='dodgerblue', linewidth=2)
+
+
+
+    ax.set_title('Average Log-Spectral Distance (LSD) vs. Frequency', fontsize=16, fontweight='bold')
+    ax.set_xlabel('Frequency (Hz)', fontsize=12)
+    ax.set_ylabel('Average LSD (dB)', fontsize=12)
+
+
+    ax.legend()
+    ax.grid(True, which="both", ls="--")
+    fig.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=300)
+        print(f"Plot saved to {save_path}")
 
 
 def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, last_epoch=-1):
@@ -363,6 +407,8 @@ def train(args):
             processed_batches = 0
             train_lsd_accum = 0.0
             num_valid_points_epoch = 0
+            epoch_total_lsd_sq_per_freq =0
+            epoch_total_val_lsd_sq_per_freq =0
 
 
             for i, batch in enumerate(train_loader):
@@ -397,9 +443,9 @@ def train(args):
                 # Reshape output back: (B*N_loc, num_freq) -> (B, N_loc, num_freq)
                 predicted_hrtfs = predicted_hrtfs_flat.reshape(B, N_loc, num_freq)
 
-                # diff = predicted_hrtfs[..., 1:] - predicted_hrtfs[..., :-1]
-                # smoothness_loss= torch.mean(torch.pow(diff, 2))
-                # lamb_val = 5e-1
+                diff = predicted_hrtfs[..., 1:] - predicted_hrtfs[..., :-1]
+                smoothness_loss= torch.mean(torch.pow(diff, 2))
+                lamb_val = 1
 
                 # Check shapes before loss calculation
                 if predicted_hrtfs.shape != target_hrtfs.shape:
@@ -413,7 +459,7 @@ def train(args):
                 # Normalize by the number of valid points (sum of mask)
                 num_valid_points_batch = torch.sum(masks)
 
-                loss = torch.sum(masked_error_squared) / num_valid_points_batch # + lamb_val*torch.sum(smoothness_loss)
+                loss = torch.sum(masked_error_squared) / num_valid_points_batch + lamb_val*torch.sum(smoothness_loss)
 
 
                 # --- Calculate LSD metric using masks ---
@@ -427,6 +473,9 @@ def train(args):
                         lsd_elements_sq = torch.square(20 * torch.log10(gt_abs / pred_abs))
                     masked_lsd_elements_sq = lsd_elements_sq * masks
                     batch_lsd_sum_sq = torch.sum(masked_lsd_elements_sq)
+                    epoch_total_lsd_sq_per_freq += torch.sum(masked_lsd_elements_sq, dim=(0, 1))
+
+
 
 
                 loss.backward()
@@ -449,6 +498,14 @@ def train(args):
                 print(f"Warning: Epoch {epoch+1} completed without any valid training points.")
                 avg_train_loss = 0.0
                 avg_train_lsd = 0.0
+
+            if (epoch+1)%100 ==0:
+                plot_lsd_vs_frequency(
+                        epoch_total_lsd_sq_per_freq,
+                        num_valid_points_epoch,
+                        NUM_FREQ_BINS,
+                        save_path='/export/mkrishn9/hrtf_field/experiments_test/img.png' # Example of saving the plot
+                )
 
 
 
@@ -501,6 +558,7 @@ def train(args):
                                 lsd_elements_sq = torch.square(20 * torch.log10(gt_abs / pred_abs))
                             masked_lsd_elements_sq = lsd_elements_sq * masks
                             val_lsd_accum += torch.sum(masked_lsd_elements_sq).item()
+                            epoch_total_val_lsd_sq_per_freq += torch.sum(masked_lsd_elements_sq, dim=(0, 1))
 
                             val_valid_points_epoch += num_valid_points_batch.item()
             # Calculate average epoch validation loss and LSD
@@ -508,6 +566,8 @@ def train(args):
             avg_val_loss = val_loss_accum / val_valid_points_epoch
             avg_val_lsd = np.sqrt(val_lsd_accum / (val_valid_points_epoch * NUM_FREQ_BINS))
             pat_count = pat_count+1
+
+
 
 
 
@@ -542,6 +602,13 @@ def train(args):
                 #         'anthro_std': anthro_std.cpu(),
                 #         }, model_save_path)
                 # print(f'saved to {model_save_path}')
+
+                plot_lsd_vs_frequency(
+                        epoch_total_val_lsd_sq_per_freq,
+                        val_valid_points_epoch,
+                        NUM_FREQ_BINS,
+                        save_path='/export/mkrishn9/hrtf_field/experiments_test/img_val.png' # Example of saving the plot
+                )
 
             if pat_count > patience:
                 break
