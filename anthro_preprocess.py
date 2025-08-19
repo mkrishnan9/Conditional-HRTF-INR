@@ -237,27 +237,27 @@ def preprocess_datasets():
     """
     dataset_config = {
         "chedar": {"sofa_name": "CHEDAR", "anthro_loader": load_chedar_anthropometry},
-        "scut": {"sofa_name": "SCUT", "anthro_loader": load_scut_anthropometry},
-        "ari": {"sofa_name": "ARI", "anthro_loader": load_ari_anthropometry},
-        "cipic": {"sofa_name": "CIPIC", "anthro_loader": load_cipic_anthropometry},
-        "hutubs": {"sofa_name": "HUTUBS", "anthro_loader": load_hutubs_anthropometry},
+        # "scut": {"sofa_name": "SCUT", "anthro_loader": load_scut_anthropometry},
+        # "ari": {"sofa_name": "ARI", "anthro_loader": load_ari_anthropometry},
+        # "cipic": {"sofa_name": "CIPIC", "anthro_loader": load_cipic_anthropometry},
+        # "hutubs": {"sofa_name": "HUTUBS", "anthro_loader": load_hutubs_anthropometry},
     }
 
 
     anthro_databases = {}
 
 
-    hutubs_csv_path = os.path.join(DATASET_PATHS["hutubs"], "AntrhopometricMeasures.csv")
-    anthro_df = pd.read_csv(hutubs_csv_path, index_col=0)
-    anthro_df.index = anthro_df.index.map(str)
-    anthro_databases["hutubs"] = anthro_df
-    print("✅ Successfully loaded HUTUBS anthropometry CSV.")
+    # hutubs_csv_path = os.path.join(DATASET_PATHS["hutubs"], "AntrhopometricMeasures.csv")
+    # anthro_df = pd.read_csv(hutubs_csv_path, index_col=0)
+    # anthro_df.index = anthro_df.index.map(str)
+    # anthro_databases["hutubs"] = anthro_df
+    # print("✅ Successfully loaded HUTUBS anthropometry CSV.")
 
-    scut_csv_path = os.path.join(DATASET_PATHS["scut"], "AnthropometricParameters.csv")
-    scut_df = pd.read_csv(scut_csv_path, index_col=0) # Assuming the first column is the subject ID
-    scut_df.index = scut_df.index.map(str)
-    anthro_databases["scut"] = scut_df
-    print("Successfully loaded SCUT anthropometry CSV.")
+    # scut_csv_path = os.path.join(DATASET_PATHS["scut"], "AnthropometricParameters.csv")
+    # scut_df = pd.read_csv(scut_csv_path, index_col=0) # Assuming the first column is the subject ID
+    # scut_df.index = scut_df.index.map(str)
+    # anthro_databases["scut"] = scut_df
+    # print("Successfully loaded SCUT anthropometry CSV.")
 
     chedar_csv_path = os.path.join(DATASET_PATHS["chedar"], "measurements.csv")
     chedar_df = pd.read_csv(chedar_csv_path)
@@ -267,13 +267,13 @@ def preprocess_datasets():
     print("Successfully loaded chedar anthropometry CSV.")
 
 
-    cipic_mat_path = os.path.join(DATASET_PATHS["cipic"], "anthro.mat")
-    anthro_databases["cipic"] = scipy.io.loadmat(cipic_mat_path)
-    print("Successfully loaded CIPIC anthropometry .mat file.")
+    # cipic_mat_path = os.path.join(DATASET_PATHS["cipic"], "anthro.mat")
+    # anthro_databases["cipic"] = scipy.io.loadmat(cipic_mat_path)
+    # print("Successfully loaded CIPIC anthropometry .mat file.")
 
-    ari_mat_path = os.path.join(DATASET_PATHS["ari"], "anthro.mat")
-    anthro_databases["ari"] = scipy.io.loadmat(ari_mat_path)
-    print("Successfully loaded ARI anthropometry .mat file.")
+    # ari_mat_path = os.path.join(DATASET_PATHS["ari"], "anthro.mat")
+    # anthro_databases["ari"] = scipy.io.loadmat(ari_mat_path)
+    # print("Successfully loaded ARI anthropometry .mat file.")
 
 
 
@@ -292,13 +292,6 @@ def preprocess_datasets():
         print(f"Found {len(dataset_obj)} HRIR files to process...")
         for idx in tqdm(range(len(dataset_obj))):
             try:
-                if name == "chedar" and idx > 1864:
-                    continue
-                elif name == "chedar" and idx<735:
-                    continue
-                elif name != "chedar":
-                    continue
-
 
                 location, hrir = dataset_obj[idx]
 
