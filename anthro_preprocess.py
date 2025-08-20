@@ -5,16 +5,17 @@ import pandas as pd
 import numpy as np
 import scipy.io
 import SOFAdatasets
-import h5py
+
 
 OUT_DIR = "/export/mkrishn9/hrtf_field/preprocessed_hrirs_common"
 
 DATASET_PATHS = {
-    "scut": "/export/mkrishn9/hrtf_field/scut",
-    "chedar": "/export/mkrishn9/hrtf_field/chedar",
-    "cipic": "/export/mkrishn9/hrtf_field/cipic",
-    "ari": "/export/mkrishn9/hrtf_field/ari",
-    "hutubs": "/export/mkrishn9/hrtf_field/hutubs"
+    "scut": "/export/mkrishn9/hrtf_field/data/scut",
+    "chedar": "/export/mkrishn9/hrtf_field/data/chedar",
+    "cipic": "/export/mkrishn9/hrtf_field/data/cipic",
+    "ari": "/export/mkrishn9/hrtf_field/data/ari",
+    "hutubs": "/export/mkrishn9/hrtf_field/data/hutubs",
+    "axd": "/export/mkrishn9/hrtf_field/data/axd_ff_win"
 }
 
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -46,6 +47,63 @@ def load_hutubs_anthropometry(subject_id, ear_side, anthro_df):
         return None
 
     return raw_anthro_data.astype(np.float32)
+
+
+def load_axd_anthropometry(subject_id, ear_side, anthro_df):
+    """
+    Loads common anthropometry for an AXD (SONICOM) subject.
+    The head/torso measurements (x1-x9) are not available in the AXD
+    anthropometry file, so they are represented as zeros.
+    """
+    try:
+        # The subject_id from the SOFA object is like 'P0005'. We need the integer part.
+        numeric_id = int(subject_id.replace('P', ''))
+    except (ValueError, TypeError):
+        print(f"Warning: Could not parse AXD subject ID '{subject_id}'. Skipping.")
+        return None
+
+    # Map the ear_side ('left'/'right') to the CSV representation ('L'/'R').
+    ear_char = 'Left' if ear_side == 'left' else 'Right'
+
+    # Find the specific row for the subject ID and ear side.
+    subject_row = anthro_df[(anthro_df['SONICOM ID'] == numeric_id) & (anthro_df['Ear'] == ear_char)]
+
+    # If no data is found for this subject/ear combination, skip.
+    if subject_row.empty:
+        # This is expected for some IDs, so we don't print a warning.
+        return None
+
+    # Define the feature columns to extract, matching the common format (d1-d8, theta1-2).
+    feature_cols = [
+        'd1(cm)', 'd2(cm)', 'd3(cm)', 'd4(cm)', 'd5(cm)',
+        'd6(cm)', 'd7(cm)', 'd8(cm)', 'theta1(deg)', 'theta2(deg)'
+    ]
+
+    # Extract the ear-related measurements.
+    ear_measurements = subject_row[feature_cols].values.flatten()
+
+    # Check for any NaN values in the extracted data.
+    if np.isnan(ear_measurements).any():
+        print(f"Warning: NaNs in anthropometry for AXD subject {subject_id} ({ear_side}). Skipping.")
+        return None
+
+    # The AXD dataset does not provide head/torso measurements (x1-x9).
+    # We create a zero vector for these to maintain a consistent feature shape.
+    common_values = np.zeros(9)
+    common_values[0] = 14.49
+
+    # Split ear measurements into d and theta values for concatenation.
+    d_values = ear_measurements[:8]
+    theta_values = ear_measurements[8:]
+
+    # Combine into the final 19-element feature vector.
+    anthropometry_vector = np.concatenate([
+        common_values,
+        d_values,
+        theta_values
+    ]).astype(np.float32)
+
+    return anthropometry_vector
 
 def load_scut_anthropometry(subject_id, ear_side, anthro_df):
     """
@@ -236,28 +294,29 @@ def preprocess_datasets():
     Main function to preprocess HRIR and anthropometric data.
     """
     dataset_config = {
-        "chedar": {"sofa_name": "CHEDAR", "anthro_loader": load_chedar_anthropometry},
+        # "chedar": {"sofa_name": "CHEDAR", "anthro_loader": load_chedar_anthropometry},
         # "scut": {"sofa_name": "SCUT", "anthro_loader": load_scut_anthropometry},
         # "ari": {"sofa_name": "ARI", "anthro_loader": load_ari_anthropometry},
         # "cipic": {"sofa_name": "CIPIC", "anthro_loader": load_cipic_anthropometry},
         # "hutubs": {"sofa_name": "HUTUBS", "anthro_loader": load_hutubs_anthropometry},
+        "axd": {"sofa_name": "AXD", "anthro_loader": load_axd_anthropometry},
     }
 
 
     anthro_databases = {}
 
 
-    # hutubs_csv_path = os.path.join(DATASET_PATHS["hutubs"], "AntrhopometricMeasures.csv")
-    # anthro_df = pd.read_csv(hutubs_csv_path, index_col=0)
-    # anthro_df.index = anthro_df.index.map(str)
-    # anthro_databases["hutubs"] = anthro_df
-    # print("✅ Successfully loaded HUTUBS anthropometry CSV.")
+    hutubs_csv_path = os.path.join(DATASET_PATHS["hutubs"], "AntrhopometricMeasures.csv")
+    anthro_df = pd.read_csv(hutubs_csv_path, index_col=0)
+    anthro_df.index = anthro_df.index.map(str)
+    anthro_databases["hutubs"] = anthro_df
+    print("✅ Successfully loaded HUTUBS anthropometry CSV.")
 
-    # scut_csv_path = os.path.join(DATASET_PATHS["scut"], "AnthropometricParameters.csv")
-    # scut_df = pd.read_csv(scut_csv_path, index_col=0) # Assuming the first column is the subject ID
-    # scut_df.index = scut_df.index.map(str)
-    # anthro_databases["scut"] = scut_df
-    # print("Successfully loaded SCUT anthropometry CSV.")
+    scut_csv_path = os.path.join(DATASET_PATHS["scut"], "AnthropometricParameters.csv")
+    scut_df = pd.read_csv(scut_csv_path, index_col=0) # Assuming the first column is the subject ID
+    scut_df.index = scut_df.index.map(str)
+    anthro_databases["scut"] = scut_df
+    print("Successfully loaded SCUT anthropometry CSV.")
 
     chedar_csv_path = os.path.join(DATASET_PATHS["chedar"], "measurements.csv")
     chedar_df = pd.read_csv(chedar_csv_path)
@@ -267,13 +326,19 @@ def preprocess_datasets():
     print("Successfully loaded chedar anthropometry CSV.")
 
 
-    # cipic_mat_path = os.path.join(DATASET_PATHS["cipic"], "anthro.mat")
-    # anthro_databases["cipic"] = scipy.io.loadmat(cipic_mat_path)
-    # print("Successfully loaded CIPIC anthropometry .mat file.")
+    cipic_mat_path = os.path.join(DATASET_PATHS["cipic"], "anthro.mat")
+    anthro_databases["cipic"] = scipy.io.loadmat(cipic_mat_path)
+    print("Successfully loaded CIPIC anthropometry .mat file.")
 
-    # ari_mat_path = os.path.join(DATASET_PATHS["ari"], "anthro.mat")
-    # anthro_databases["ari"] = scipy.io.loadmat(ari_mat_path)
-    # print("Successfully loaded ARI anthropometry .mat file.")
+    ari_mat_path = os.path.join(DATASET_PATHS["ari"], "anthro.mat")
+    anthro_databases["ari"] = scipy.io.loadmat(ari_mat_path)
+    print("Successfully loaded ARI anthropometry .mat file.")
+
+
+    axd_csv_path = os.path.join(DATASET_PATHS["axd"], "SONICOM_Anthropometries.csv")
+    axd_df = pd.read_csv(axd_csv_path)
+    anthro_databases["axd"] = axd_df
+    print("✅ Successfully loaded AXD anthropometry CSV.")
 
 
 
@@ -293,6 +358,7 @@ def preprocess_datasets():
         for idx in tqdm(range(len(dataset_obj))):
             try:
 
+
                 location, hrir = dataset_obj[idx]
 
                 subject_idx = idx // 2
@@ -304,7 +370,7 @@ def preprocess_datasets():
 
                 loader_func = config["anthro_loader"]
 
-                if name in ["scut", "chedar"]:
+                if name in ["scut", "chedar", "axd"]:
                     subject_id_ant = str(int(subject_id))
                     raw_anthro_data = loader_func(subject_id_ant, ear_side, anthro_databases[name])
                 else:

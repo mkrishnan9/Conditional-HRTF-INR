@@ -616,8 +616,9 @@ class MergedHRTFDataset(Dataset):
         location_tensor = torch.from_numpy(location_extended.astype(np.float32))
         hrtf_tensor = torch.from_numpy(hrtf_extended.astype(np.float32))
         anthro_tensor = torch.from_numpy(anthro_np.astype(np.float32))
+        ear_tensor = anthro_tensor[9:]
 
-        return location_tensor, hrtf_tensor, anthro_tensor, dataset_name
+        return location_tensor, hrtf_tensor, ear_tensor, dataset_name
 
 
 

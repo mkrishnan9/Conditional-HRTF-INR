@@ -22,8 +22,7 @@ torch.set_float32_matmul_precision('high')
 import math
 from HRTFdatasets import MergedHRTFDataset
 from model import (
-        CondHRTFNetwork,
-        HRTFNetwork3D
+        CondHRTFNetwork
     )
 
 import logging
@@ -34,7 +33,63 @@ C_SOUND = 343.0  # Speed of sound in m/s
 
 from torch.func import vmap
 
+def compute_laplacian(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """
+    Computes the Laplacian of a multi-channel output `y` with respect to spatial inputs `x`.
 
+    The Laplacian is defined as ∇²y = Σᵢ (∂²y / ∂xᵢ²). This function calculates
+    this quantity for each channel in `y` independently. It's the trace of the Hessian matrix.
+
+    Args:
+        y (torch.Tensor): The output tensor from the model, with shape (N, C), where N is the
+                          number of points and C is the number of output channels (e.g., 92 frequency bins).
+        x (torch.Tensor): The input tensor for which the derivatives are computed. It must have
+                          `requires_grad=True`. Its shape should be (N, D), where D is the number of
+                          spatial dimensions (typically 3 for Cartesian coordinates).
+
+    Returns:
+        torch.Tensor: A tensor of shape (N, C) containing the Laplacian of each output channel.
+    """
+    if not x.requires_grad:
+        raise ValueError("Input tensor `x` must have `requires_grad=True`.")
+
+    num_points, num_channels = y.shape
+    num_dims = x.shape[1]
+
+    laplacian = torch.zeros(num_points, num_channels, device=y.device)
+
+    # Loop over each of the C output channels (frequency bins).
+    for i in range(num_channels):
+        # Consider one channel at a time.
+        y_i = y[:, i]
+
+        # 1. Compute the first derivative (gradient) of this channel w.r.t. all spatial inputs.
+        # `create_graph=True` is essential as we need to differentiate the result again.
+        grad_y_i = torch.autograd.grad(
+            outputs=y_i,
+            inputs=x,
+            grad_outputs=torch.ones_like(y_i),
+            create_graph=True
+        )[0]  # Result shape: (N, D), this is [∂yᵢ/∂x₁, ∂yᵢ/∂x₂, ...]
+
+        # 2. Compute the second derivatives by taking the divergence of the gradient field.
+        # We loop over the D spatial dimensions.
+        for j in range(num_dims):
+            # Differentiate ∂yᵢ/∂xⱼ with respect to all inputs x again.
+            grad_y_i_j = grad_y_i[:, j]
+
+            # The result is [∂²yᵢ/∂xⱼ∂x₁, ∂²yᵢ/∂xⱼ∂x₂, ...]. We only need the j-th component.
+            second_deriv_vec = torch.autograd.grad(
+                outputs=grad_y_i_j,
+                inputs=x,
+                grad_outputs=torch.ones_like(grad_y_i_j),
+                create_graph=False  # Not needed for the final derivative calculation
+            )[0] # Result shape: (N, D)
+
+            # Add the diagonal term of the Hessian (∂²yᵢ/∂xⱼ²) to the Laplacian.
+            laplacian[:, i] += second_deriv_vec[:, j]
+
+    return laplacian
 
 def spherical_to_cartesian(coords_deg, radius=1.0):
     """
@@ -367,13 +422,14 @@ def train(args):
                     phys_anthro = anthro_expanded.reshape(-1, ANTHROPOMETRY_DIM)
 
                     # 4. Forward pass and compute Laplacian
-                    h_phys_log = model(phys_locs_cartesian, phys_anthro)
+                    h_phys = model(phys_locs_cartesian, phys_anthro)
 
-                    h_phys = 10**((50 * (h_phys_log + 1)+85) / 20) ## Inverse of all transformations done during preprocessing
+                    #h_phys = 10**((50 * (h_phys_log + 1)-85) / 20) ## Inverse of all transformations done during preprocessing
                     laplacian_h = compute_laplacian(h_phys, phys_locs_cartesian)
 
+
                     # 5. Calculate Helmholtz residual: laplacian(H) + k^2 * H
-                    helmholtz_residual = laplacian_h + k_squared.unsqueeze(0) * h_phys
+                    helmholtz_residual = laplacian_h #+ k_squared.unsqueeze(0) * h_phys
                     loss_phys = torch.mean(torch.square(helmholtz_residual))
 
                     # 6. Add weighted physics loss to the total loss
@@ -474,7 +530,7 @@ if __name__ == "__main__":
     # Path Arguments
     parser.add_argument('--data_path', type=str, default="/export/mkrishn9/hrtf_field/preprocessed_hrirs_common")
     parser.add_argument('--save_dir', type=str, default="/export/mkrishn9/hrtf_field/experiments_test")
-    parser.add_argument('--gpu', type=int, default=0)
+    parser.add_argument('--gpu', type=int, default=5)
     parser.add_argument('--include_datasets', type=str, default="all")
     parser.add_argument('--load_checkpoint', type=str, default=None)
 
@@ -484,18 +540,18 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, default=1000)
 
     # Model Hyperparameters
-    parser.add_argument('--latent_dim', type=int, default=32)
-    parser.add_argument('--hidden_dim', type=int, default=128)
-    parser.add_argument('--n_layers', type=int, default=5)
+    parser.add_argument('--latent_dim', type=int, default=256)
+    parser.add_argument('--hidden_dim', type=int, default=256)
+    parser.add_argument('--n_layers', type=int, default=4)
     parser.add_argument('--scale', type=str, default="log")
-    parser.add_argument('--eta_min', type=float, default=1e-7)
+    parser.add_argument('--eta_min', type=float, default=1e-15)
     parser.add_argument('--val_split', type=float, default=0.15)
-    parser.add_argument('--aug_prob', type=float, default=0.5)
+    parser.add_argument('--aug_prob', type=float, default=0.0)
 
     # ==============================================================================
     # === NEW ARGUMENT FOR HELMHOLTZ CONSTRAINT ====================================
     # ==============================================================================
-    parser.add_argument('--lambda_helmholtz', type=float, default=0.0,
+    parser.add_argument('--lambda_helmholtz', type=float, default=1e-5,
                         help='Weighting factor for the Helmholtz physics loss. Set to 0 to disable.')
     # ==============================================================================
 

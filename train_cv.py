@@ -234,7 +234,7 @@ def train(args):
 
     DATA_PATH = args.data_path
 
-    ANTHROPOMETRY_DIM = 19 # 23 ### HARDCODED
+    ANTHROPOMETRY_DIM = 10 # 23 ### HARDCODED
 
     # *******************************
 
@@ -314,7 +314,7 @@ def train(args):
     indices = np.arange(len(merged_dataset))
     groups = np.array([registry_to_subject_id[i] for i in indices])
 
-    N_SPLITS = 5 # A common choice
+    N_SPLITS = 5
     kfold = GroupKFold(n_splits=N_SPLITS)
 
     fold_results = []
@@ -611,6 +611,7 @@ def train(args):
                 )
 
             if pat_count > patience:
+                print(f"Validation loss has not improved in {patience:03d} epochs. Terminating.")
                 break
 
         print("\nTraining finished.")

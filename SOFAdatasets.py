@@ -267,7 +267,7 @@ class ARI(SOFADataset):
     def __init__(self):
         super(ARI, self).__init__()
         self.name = "ari"
-        self.sofa_dir = "/export/mkrishn9/hrtf_field/ari/"
+        self.sofa_dir = "/export/mkrishn9/hrtf_field/data/ari/"
         self._expand_basic_info()
 
     def _get_all_sofa_files_from_dir(self):
@@ -284,7 +284,7 @@ class HUTUBS(SOFADataset):
     def __init__(self):
         super(HUTUBS, self).__init__()
         self.name = "hutubs"
-        DATASET_PATH = "/export/mkrishn9/hrtf_field/hutubs/"
+        DATASET_PATH = "/export/mkrishn9/hrtf_field/data/hutubs/"
         # self.sofa_dir = os.path.join(DATASET_PATH, "HUTUBS/HRIRs")
         self.sofa_dir = DATASET_PATH
         self._expand_basic_info()
@@ -320,7 +320,7 @@ class CIPIC(SOFADataset):
     def __init__(self):
         super(CIPIC, self).__init__()
         self.name = "cipic"
-        self.sofa_dir = "/export/mkrishn9/hrtf_field/cipic" # os.path.join(DATASET_PATH, "CIPIC/sofa")
+        self.sofa_dir = "/export/mkrishn9/hrtf_field/data/cipic" # os.path.join(DATASET_PATH, "CIPIC/sofa")
         self._expand_basic_info()
 
     def _get_all_sofa_files_from_dir(self):
@@ -336,7 +336,7 @@ class SCUT(SOFADataset):
     def __init__(self):
         super(SCUT, self).__init__()
         self.name = "scut"
-        self.sofa_dir = "/export/mkrishn9/hrtf_field/scut/"
+        self.sofa_dir = "/export/mkrishn9/hrtf_field/data/scut/"
         self._expand_basic_info()
 
     def _get_all_sofa_files_from_dir(self):
@@ -351,11 +351,30 @@ class SCUT(SOFADataset):
         filename = f"SCUT_NF_subject{int(subject_ID):04d}_measured.sofa"
         return os.path.join(self.sofa_dir, filename)
 
+class AXD(SOFADataset):
+    def __init__(self):
+        super(AXD, self).__init__()
+        self.name = "axd"
+        self.sofa_dir = "/export/mkrishn9/hrtf_field/data/axd_ff_win"
+        self._expand_basic_info()
+
+    def _get_all_sofa_files_from_dir(self):
+        return glob.glob(os.path.join(self.sofa_dir, "*_FreeFieldComp_44kHz.sofa"))
+
+    def _get_ID_from_sofa_path(self, path):
+        basename = os.path.basename(path)
+        subject_part = basename.split('_')[0]
+        return subject_part.replace('P', '')
+
+    def _get_sofa_path_from_ID(self, subject_ID):
+        filename = f"P{int(subject_ID):04d}_FreeFieldComp_44kHz.sofa"
+        return os.path.join(self.sofa_dir, filename)
+
 class CHEDAR(SOFADataset):
     def __init__(self):
         super(CHEDAR, self).__init__()
         self.name = "chedar"
-        self.sofa_dir = "/export/mkrishn9/hrtf_field/chedar/"
+        self.sofa_dir = "/export/mkrishn9/hrtf_field/data/chedar/"
         self._expand_basic_info()
 
     def _get_all_sofa_files_from_dir(self):
