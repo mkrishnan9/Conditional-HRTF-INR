@@ -577,7 +577,7 @@ class MergedHRTFDataset(Dataset):
             dtf_np = hrtf_np / (ctf + 1e-10)
             if self.scale == "log":
                 ctf = 20 * np.log10(ctf + 1e-9)
-                dtf_np = dtf_np = 20 * np.log10(dtf_np + 1e-9)
+                dtf_np = 20 * np.log10(dtf_np + 1e-9)
             hrtf_np = dtf_np
         else:
             if self.norm_way == 0:
@@ -866,45 +866,92 @@ class MergedHRTFDataset1(Dataset):
         tf = np.abs(np.fft.fft(hrir, n=256))
 
         hrtf_np = tf[:,1:93]
+        compute_dtf = True
 
-        if self.norm_way == 0:
-            max_val = np.max((hrtf_np))
-            if max_val > 1e-9: hrtf_np = hrtf_np / max_val
-        elif self.norm_way == 1:
-            mag_flatten = hrtf_np.flatten()
-            max_mag = np.mean(sorted(mag_flatten)[-int(mag_flatten.shape[0] / 20):])
-            hrtf_np = hrtf_np / max_mag
-        elif self.norm_way == 2:
-            equator_index = np.where(np.logical_and(location[:, 1] > -1, location[:, 1] <= 0))
-            hrtf_equator = hrtf_np[equator_index]
-            equator_azi = location[equator_index, 0][0]
-            new_equator_index = np.argsort(equator_azi)
-            new_equator_azi = equator_azi[new_equator_index]
-            new_equator_tf = hrtf_equator[new_equator_index]
+        if compute_dtf:
+            ctf = self._compute_ctf(hrtf_np, location)
+            dtf_np = hrtf_np / (ctf + 1e-10)
+            if self.scale == "log":
+                ctf = 20 * np.log10(ctf + 1e-9)
+                dtf_np = 20 * np.log10(dtf_np + 1e-9)
+            hrtf_np = dtf_np
+        else:
+            if self.norm_way == 0:
+                max_val = np.max((hrtf_np))
+                if max_val > 1e-9: hrtf_np = hrtf_np / max_val
+            ## second way is to divide by top 5% top value
+            elif self.norm_way == 1:
+                mag_flatten = hrtf_np.flatten()
+                max_mag = np.mean(sorted(mag_flatten)[-int(mag_flatten.shape[0] / 20):])
+                hrtf_np = hrtf_np / max_mag
+            ## third way is to compute total energy of the equator
+            elif self.norm_way == 2:
+                equator_index = np.where(np.logical_and(location[:, 1] > -1, location[:, 1] <= 0))
+                hrtf_equator = hrtf_np[equator_index]
+                equator_azi = location[equator_index, 0][0]
+                new_equator_index = np.argsort(equator_azi)
+                new_equator_azi = equator_azi[new_equator_index]
+                new_equator_tf = hrtf_equator[new_equator_index]
 
-            total_energy = 0
-            for x in range(len(new_equator_index)):
-                if x == 0:
-                    d_azi = 360 - new_equator_azi[-1]
-                else:
-                    d_azi = new_equator_azi[x] - new_equator_azi[x - 1]
-                total_energy += np.square(new_equator_tf[x]).mean() * d_azi
-            hrtf_np = hrtf_np / np.sqrt(total_energy / 360)
-        elif self.norm_way == 4:
-            if self.scale == 'log':
-                max_val = 20
-                min_val =  -100
-                hrtf_np = 2* (hrtf_np-min_val)/(max_val-min_val) -1
+                total_energy = 0
+                for x in range(len(new_equator_index)):
+                    if x == 0:
+                        d_azi = 360 - new_equator_azi[-1]
+                        # d_azi = new_equator_azi[1] - new_equator_azi[0]
+                    else:
+                        d_azi = new_equator_azi[x] - new_equator_azi[x - 1]
+                    total_energy += np.square(new_equator_tf[x]).mean() * d_azi
+                hrtf_np = hrtf_np / np.sqrt(total_energy / 360)
+                breakpoint()
+            elif self.norm_way == 4:
+                if self.scale == 'log':
+                    max_val = 20 #np.max(hrtf_np)
+                    min_val =  -100 #np.min(hrtf_np)
+                    hrtf_np = 2* (hrtf_np-min_val)/(max_val-min_val) -1
 
-        if self.scale == "linear":
-            hrtf_np = hrtf_np
-        if self.scale == "log":
-            hrtf_np = 20 * np.log10(hrtf_np + 1e-9)
-            # max_val = 15
-            # min_val =  -85
-            # hrtf_np = 2* (hrtf_np-min_val)/(max_val-min_val) -1
+            #     # print(np.sqrt(total_energy / 360))
+            # ## fourth way is to normalize on common locations
+            # ## [(0.0, 0.0), (180.0, 0.0), (210.0, 0.0), (330.0, 0.0), (30.0, 0.0), (150.0, 0.0)]
+            # elif norm_way == 3:
+            #     common_index = np.where(np.logical_and(np.logical_and(location[:, 1] > -1, location[:, 1] <= 0),
+            #                                            np.array(
+            #                                                [round(x) in [0, 180, 210, 330, 30, 150] for x in location[:, 0]])))
+            #     tf_common = tf[common_index]
+            #     mean_energy = np.sqrt(np.square(tf_common).mean())
+            #     # print(mean_energy)
+            #     tf = tf / mean_energy
+
+            if self.scale == "linear":
+                hrtf_np = hrtf_np
+            if self.scale == "log":
+                hrtf_np = 20 * np.log10(hrtf_np + 1e-9)
+                # max_val = 15 #np.max(hrtf_np)                           # Max HRTF value after normalizing based on equation energy (norm_way=2)
+                # min_val =  -85 #np.min(hrtf_np)                         # Min HRTF value after normalizing based on equation energy (norm_way=2)
+                # hrtf_np = 2* (hrtf_np-min_val)/(max_val-min_val) -1     ## Normalize to (-1,1)
 
         return hrtf_np
+
+    def _compute_ctf(self, hrtf_np, location):
+        """
+        Compute CTF using diffuse-field average method.
+        CTF represents the direction-independent component.
+        """
+        # Method 1: Simple RMS average across all directions
+        # ctf = np.sqrt(np.mean(hrtf_np**2, axis=0, keepdims=True))
+
+        # Method 2: Weighted average based on solid angle (more accurate)
+        # Weight by elevation to account for sphere sampling density
+        elevation_weights = np.cos(np.radians(location[:, 1]))
+        elevation_weights = elevation_weights / np.sum(elevation_weights)
+
+        # Weighted RMS average
+        weighted_hrtf = hrtf_np * elevation_weights[:, np.newaxis]
+        ctf = np.sqrt(np.sum(weighted_hrtf**2, axis=0, keepdims=True))
+
+        # Method 3: Geometric mean (alternative)
+        # ctf = np.exp(np.mean(np.log(hrtf_np + 1e-10), axis=0, keepdims=True))
+
+        return ctf
 
     def extend_locations(self, locs_np, hrtfs_np):
         """ Extends azimuth range to handle wrap-around for model interpolation. """
