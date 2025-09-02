@@ -14,7 +14,7 @@ import re
 from sklearn.model_selection import GroupShuffleSplit
 
 sys.path.insert(0, '/export/mkrishn9/hrtf_field')
-from HRTFdatasets import MergedHRTFDataset1
+from HRTFdatasets import MergedHRTFDataset
 from train_cv import merged_collate_fn
 
 
@@ -365,7 +365,7 @@ def train_dual_autoencoder(model, train_loader, val_loader, device,
         for batch_idx, batch in enumerate(train_loader):
             if batch_idx > 20:  # Sample first 20 batches for fitting
                 break
-            locations, hrtfs, masks, anthropometry, _, _ = batch
+            locations, hrtfs, masks, anthropometry, _ = batch
             B, N, _ = locations.shape
 
             locations = locations.reshape(-1, 2).to(device)
@@ -413,7 +413,7 @@ def train_dual_autoencoder(model, train_loader, val_loader, device,
         batch_count = 0
 
         for batch in train_loader:
-            locations, hrtfs, masks, anthropometry, _, _ = batch
+            locations, hrtfs, masks, anthropometry, _ = batch
             locations = locations.reshape(-1, 2).to(device)
             hrtfs = hrtfs.reshape(-1, model.num_freq).to(device)
             masks = masks.to(device)
@@ -622,7 +622,7 @@ def run_benchmark(data_path, save_dir, anthro_dim=10, num_freq=92, batch_size=4)
     print(f"Using device: {device}")
 
     # Load dataset - HUTUBS only as per paper
-    dataset = MergedHRTFDataset1(
+    dataset = MergedHRTFDataset(
         dataset_names=["hutubs"],
         preprocessed_dir=data_path,
         augment=False,
